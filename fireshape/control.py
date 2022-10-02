@@ -1,15 +1,20 @@
+from curses.ascii import BS
+from math import ceil, floor, log2, factorial
 from .innerproduct import InnerProduct
 import ROL
 import firedrake as fd
 
 __all__ = ["FeControlSpace", "FeMultiGridControlSpace",
-           "BsplineControlSpace", "ControlVector"]
+           "BsplineControlSpace", "BsplineWaveletControlSpace",
+           "ControlVector"]
 
 # new imports for splines
 from firedrake.petsc import PETSc
 from functools import reduce
-from scipy.interpolate import splev
+from scipy.interpolate import BSpline, splev
+from scipy.special import binom
 import numpy as np
+import matplotlib.pyplot as plt
 
 
 class ControlSpace(object):
@@ -652,6 +657,359 @@ class BsplineControlSpace(ControlSpace):
         """
         viewer = PETSc.Viewer().createBinary(filename, mode="r")
         vec.vec_wo().load(viewer)
+
+
+class BsplineWaveletControlSpace(BsplineControlSpace):
+    """ControlSpace based on cartesian tensorized Bspline wavelets."""
+
+    def __init__(self, mesh, bbox, primal_orders, dual_orders, levels,
+                 fixed_dims=[], boundary_regularities=None):
+        self.primal_orders = primal_orders
+        self.dual_orders = dual_orders
+        self.levels = levels
+        self.boundary_regularities = boundary_regularities
+        self.construct_wavelet_transform_matrices()
+        super().__init__(mesh, bbox, primal_orders, levels, fixed_dims,
+                         boundary_regularities)
+
+    def construct_1d_interpolation_matrices(self, V):
+        """
+        Create a list of sparse matrices (one per geometric dimension).
+
+        Each matrix has size (M, n[dim]), where M is the dimension of the
+        self.V_r.sub(0), and n[dim] is the dimension of the univariate
+        wavelet space associated to the dimth-geometric coordinate.
+        The ith column of such a matrix is computed by evaluating the ith
+        univariate B-spline wavelet on the dimth-geometric coordinates of
+        the dofs of self.V_r(0)
+        """
+        interp_1d = []
+
+        # this code is correct but can be made more beautiful
+        # by replacing x_fct with self.id
+        x_fct = fd.SpatialCoordinate(self.mesh_r)  # used for x_int
+        # compute self.M, x_int will be overwritten below
+        x_int = fd.interpolate(x_fct[0], V.sub(0))
+        self.M = x_int.vector().size()
+
+        comm = self.comm
+
+        u, v = fd.TrialFunction(V.sub(0)), fd.TestFunction(V.sub(0))
+        mass_temp = fd.assemble(u * v * fd.dx)
+        self.lg_map_fe = mass_temp.petscmat.getLGMap()[0]
+
+        for dim in range(self.dim):
+
+            order = self.orders[dim]
+            knots = self.knots[dim]
+            n = self.n[dim]
+            T = self.WT[dim]
+
+            # owned part of global problem
+            local_n = n // comm.size + int(comm.rank < (n % comm.size))
+            I = PETSc.Mat().create(comm=self.comm)
+            I.setType(PETSc.Mat.Type.AIJ)
+            lsize = x_int.vector().local_size()
+            gsize = x_int.vector().size()
+            I.setSizes(((lsize, gsize), (local_n, n)))
+
+            I.setUp()
+            x_int = fd.interpolate(x_fct[dim], V.sub(0))
+            x = x_int.vector().get_local()
+            for idx in range(n):
+                coeffs = T[:, idx]
+                b = BSpline(knots, coeffs, order - 1)
+
+                values = b(x)
+                rows = np.where(values != 0)[0].astype(np.int32)
+                values = values[rows]
+                rows_is = PETSc.IS().createGeneral(rows)
+                global_rows_is = self.lg_map_fe.applyIS(rows_is)
+                rows = global_rows_is.array
+                I.setValues(rows, [idx], values)
+
+            I.assemble()  # lazy strategy for kron
+            interp_1d.append(I)
+
+        # from IPython import embed; embed()
+        return interp_1d
+
+    def construct_wavelet_transform_matrices(self):
+        self.WT = []
+
+        for dim in range(len(self.primal_orders)):
+            d = self.d = self.primal_orders[dim]
+            d_t = self.d_t = self.dual_orders[dim]
+            assert (d + d_t) % 2 == 0
+
+            self.compute_primal_refinement_coeffs()
+            self.compute_dual_refinement_coeffs()
+            self.construct_primal_ML()
+            self.construct_dual_ML()
+
+            j0 = ceil(log2(d + 2 * d_t - 3) + 1)  # minimal level
+            J = self.levels[dim]
+            assert J > j0
+            T = 2**(J / 2) * np.identity(2**J + d - 1)
+            for j in range(j0, J):
+                Tj = self.construct_refinement_matrix(j)
+                m, n = Tj.shape
+                T[:m, :n] = T[:m, :n] @ Tj
+            T[np.abs(T) < 1e-12] = 0.
+            self.WT.append(T)
+
+        del self.d, self.l1, self.l2, self.a, self.ML, \
+            self.d_t, self.l1_t, self.l2_t, self.a_t, self.ML_t
+
+    def construct_refinement_matrix(self, j):
+        M0, M1 = self.initial_completion(j)
+        M0_t = self.construct_dual_refinement_matrix(j)
+        M1 = M1 - M0 @ M0_t.T @ M1
+        return np.hstack((M0, M1))
+
+    def compute_primal_refinement_coeffs(self):
+        """
+        Compute refinement coefficients of the primal scaling function of
+        order d.
+        """
+        d = self.d
+        l1 = self.l1 = -floor(d / 2)
+        l2 = self.l2 = ceil(d / 2)
+
+        self.a = 2**(1 - d) * \
+            np.array([binom(d, k - l1) for k in range(l1, l2 + 1)])
+
+    def construct_primal_ML(self):
+        """
+        Construct the refinement matrix for primal boundary functions.
+        """
+        d = self.d
+        knots = np.concatenate((np.zeros(d - 1), np.arange(2 * d - 1)))
+        x = np.arange(2 * d - 2)
+
+        B1 = np.empty((2 * d - 2, d - 1))
+        B2 = np.empty((2 * d - 2, 2 * d - 2))
+        for k in range(d - 1):
+            coeffs = np.zeros(2 * d - 2)
+            coeffs[k] = 1.
+            b = BSpline(knots, coeffs, d - 1)
+            B1[:, k] = b(x / 2)
+            B2[:, k] = b(x)
+        for k in range(d - 1, 2 * d - 2):
+            coeffs = np.zeros(2 * d - 2)
+            coeffs[k] = 1.
+            b = BSpline(knots, coeffs, d - 1)
+            B2[:, k] = b(x)
+        self.ML = np.linalg.solve(B2, B1)
+
+    def construct_primal_refinement_matrix(self, j):
+        d = self.d
+
+        # refinement matrix for primal inner functions
+        A = np.zeros((2**(j + 1) - d + 1, 2**j - d + 1))
+        for k in range(2**j - d + 1):
+            A[2*k:2*k+d+1, k] = self.a
+
+        M0 = np.zeros((2**(j+1) + d - 1, 2**j + d - 1))
+        M0[:2*d-2, :d-1] = self.ML
+        M0[d-1:2**(j+1), d-1:2**j] = A
+        M0[-(2*d-2):, -(d-1):] = self.ML[::-1, ::-1]
+        return M0 / np.sqrt(2)
+
+    def compute_dual_refinement_coeffs(self):
+        """
+        Compute refinement coefficients of the dual scaling function of
+        order d and dual order d_t.
+        """
+        d = self.d
+        d_t = self.d_t
+        l1_t = self.l1_t = -floor(d / 2) - d_t + 1
+        l2_t = self.l2_t = ceil(d / 2) + d_t - 1
+        K = (d + d_t) // 2
+
+        a_t = []
+        for k in range(l1_t, l2_t + 1):
+            a_k = 0
+            for n in range(K):
+                for i in range(2 * n + 1):
+                    a_k += 2**(1 - d_t - 2 * n) * (-1)**(n + i) \
+                           * binom(d_t, k + floor(d_t / 2) - i + n) \
+                           * binom(K - 1 + n, n) * binom(2 * n, i)
+            a_t.append(a_k)
+        self.a_t = np.array(a_t)
+
+    def construct_dual_ML(self):
+        """
+        Construct the refinement matrix for dual boundary functions.
+        """
+        d = self.d
+        d_t = self.d_t
+        l1 = self.l1
+        l2 = self.l2
+        l1_t = self.l1_t
+        l2_t = self.l2_t
+        a = self.a
+        a_t = self.a_t
+
+        # make the size of ML compatible with ML_t
+        ML = np.zeros((2*d + 3*d_t - 5, d + d_t - 2))
+        ML[:2*d-2, :d-1] = self.ML
+        for k in range(d-1, d+d_t-2):
+            ML[2*k-d+1:2*k+2, k] = self.a
+        ML_t = np.zeros((2*d + 3*d_t - 5, d + d_t - 2))
+
+        # Compute block of ML_t corresponding to k = d-2, ..., d+2*d_t-3
+
+        # Compute alpha_{0,r}
+        alpha0 = np.zeros(d_t)
+        alpha0[0] = 1
+        for r in range(1, d_t):
+            for k in range(l1, l2 + 1):
+                sum = 0
+                for s in range(r):
+                    sum += binom(r, s) * k**(r - s) * alpha0[s]
+                alpha0[r] += a[k-l1] * sum
+            alpha0[r] /= (2**(r+1) - 2)
+
+        # Compute alpha_{k,r}
+        def alpha(k, r):
+            res = 0
+            for i in range(r + 1):
+                res += binom(r, i) * k**i * alpha0[r - i]
+            return res
+
+        # Compute beta_{n,r}
+        def beta(n, r):
+            res = 0
+            for k in range(ceil((n - l2_t) / 2), -l1_t):
+                res += alpha(k, r) * a_t[n - 2*k - l1_t]
+            return res
+
+        def divided_diff(f, t):
+            if t.size == 1:
+                return f(t[0])
+            return (divided_diff(f, t[1:]) - divided_diff(f, t[:-1])) \
+                / (t[-1] - t[0])
+
+        D1 = np.zeros((d_t, d_t))
+        D2 = np.zeros((d_t, d_t))
+        D3 = np.zeros((d_t, d_t))
+        k0 = -self.l1_t - 1
+        for n in range(d_t):
+            for k in range(n+1):
+                D1[n, k] = binom(n, k) * alpha0[n - k]
+                D2[n, k] = binom(n, k) * k0**(n - k) * (-1)**k
+                D3[n, k] = factorial(k) \
+                    * divided_diff(lambda x: x**n, np.arange(k + 1))
+        D_t = (D1 @ D2 @ D3)[:, ::-1]
+        block1 = np.empty((d + 3*d_t - 3, d_t))
+        block1[:d_t, :] = \
+            D_t.T @ np.diag([2**(-r) for r in range(d_t)])
+        block1[d_t:, :] = np.array([[beta(n - l1_t, r) for r in range(d_t)]
+                                    for n in range(d + 2*d_t - 3)])
+        ML_t[d-2:, d-2:] = block1 @ np.linalg.inv(D_t.T)
+
+        # Compute block of ML_t corresponding to k = 0, ..., d-3
+
+        def compute_gramian():
+            n = ML.shape[1]
+            UL = ML[:n, :]
+            LL = ML[n:, :]
+            UL_t = ML_t[:n, :]
+            LL_t = ML_t[n:, :]
+            lhs = 2 * np.identity(n**2) - np.kron(UL_t.T, UL.T)
+            rhs = (LL.T @ LL_t).reshape(-1, order='F')
+            gamma = np.linalg.solve(lhs, rhs)
+            return gamma.reshape((n, n), order='F')
+
+        gramian_full = np.identity(2*d + 3*d_t - 5)
+        for k in range(d - 3, -1, -1):
+            gramian_full[:d+d_t-2, :d+d_t-2] = compute_gramian()
+            B_k = ML[:, :k+d].T @ gramian_full[:, k+1:2*k+d+1] / 2.
+
+            delta = np.zeros(k+d)
+            delta[k] = 1
+            ML_t[k+1:2*k+d+1, k] = np.linalg.solve(B_k, delta)
+
+        # Biorthogonalization
+
+        gramian = compute_gramian()
+        ML_t[:d+d_t-2, :d+d_t-2] = gramian @ ML_t[:d+d_t-2, :d+d_t-2]
+        ML_t = ML_t @ np.linalg.inv(gramian)
+
+        self.ML_t = ML_t
+
+    def construct_dual_refinement_matrix(self, j):
+        d = self.d
+        d_t = self.d_t
+
+        # refinement matrix for dual inner functions
+        A_t = np.zeros((2**(j+1) - d - 2*d_t + 3, 2**j - d - 2*d_t + 3))
+        for k in range(2**j - d - 2*d_t + 3):
+            A_t[2*k:2*k+d+2*d_t-1, k] = self.a_t
+
+        M0_t = np.zeros((2**(j + 1) + d - 1, 2**j + d - 1))
+        M0_t[:2*d+3*d_t-5, :d+d_t-2] = self.ML_t
+        M0_t[d+d_t-2:2**(j+1)-d_t+1, d+d_t-2:2**j-d_t+1] = A_t
+        M0_t[-(2*d+3*d_t-5):, -(d+d_t-2):] = self.ML_t[::-1, ::-1]
+        return M0_t / np.sqrt(2)
+
+    def initial_completion(self, j):
+        d = self.d
+        l1 = self.l1
+        l2 = self.l2
+        p = 2**j - d + 1
+        q = 2**(j + 1) - d + 1
+
+        ML = self.ML
+        P = np.identity(q + 2*d - 2)
+        P[:2*d-2, :d-1] = ML / np.sqrt(2)
+        P[-(2*d-2):, -(d-1):] = ML[::-1, ::-1] / np.sqrt(2)
+
+        M0 = self.construct_primal_refinement_matrix(j)
+        A = M0[d-1:q+d-1, d-1:p+d-1]
+        H_inv = np.identity(q)
+        for i in range(d):
+            if i % 2 == 0:
+                m = i // 2
+                repeat = p + min((d-m-1)//2, 1)
+                U = np.array([[1, -A[m, 0] / A[m+1, 0]], [0, 1]])
+                U = np.kron(np.identity(repeat), U)
+                U_inv = np.array([[1, A[m, 0] / A[m+1, 0]], [0, 1]])
+                U_inv = np.kron(np.identity(repeat), U_inv)
+
+                H_i = np.identity(q)
+                H_i[m:m+2*repeat, m:m+2*repeat] = U
+                H_i_inv = np.identity(q)
+                H_i_inv[m:m+2*repeat, m:m+2*repeat] = U_inv
+
+            else:
+                m = (i-1) // 2
+                repeat = p + min((d-m-1)//2, 1)
+                L = np.array([[1, 0], [-A[d-m, 0] / A[d-m-1, 0], 1]])
+                L = np.kron(np.identity(repeat), L)
+                L_inv = np.array([[1, 0], [A[d-m, 0] / A[d-m-1, 0], 1]])
+                L_inv = np.kron(np.identity(repeat), L_inv)
+
+                H_i = np.identity(q)
+                H_i[q-m-2*repeat:q-m, q-m-2*repeat:q-m] = L
+                H_i_inv = np.identity(q)
+                H_i_inv[q-m-2*repeat:q-m, q-m-2*repeat:q-m] = L_inv
+
+            A = H_i @ A
+            H_inv = H_inv @ H_i_inv
+
+        b = A[l2, 0]
+        F_hat = np.zeros((q + 2*d - 2, 2**j))
+        F_hat[d-1:l2+d-2, :l2-1] = np.identity(l2-1)
+        F_hat[d-1:q+d-1, l2-1:p+l2-1] = np.roll(A / b, -1, 0)
+        F_hat[l1-(d-1):-(d-1), l1:] = np.identity(-l1)
+
+        H_hat_inv = np.identity(q + 2*d - 2)
+        H_hat_inv[d-1:-(d-1), d-1:-(d-1)] = H_inv
+
+        M1 = P @ H_hat_inv @ F_hat
+        return M0, M1
 
 
 class ControlVector(ROL.Vector):
