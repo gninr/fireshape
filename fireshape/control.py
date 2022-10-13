@@ -14,7 +14,6 @@ from functools import reduce
 from scipy.interpolate import BSpline, splev
 from scipy.special import binom
 import numpy as np
-import matplotlib.pyplot as plt
 
 
 class ControlSpace(object):
@@ -663,7 +662,7 @@ class BsplineWaveletControlSpace(BsplineControlSpace):
     """ControlSpace based on cartesian tensorized Bspline wavelets."""
 
     def __init__(self, mesh, bbox, primal_orders, dual_orders, levels,
-                 fixed_dims=[], boundary_regularities=None):
+                 fixed_dims=[], boundary_regularities=None, threshold=None):
         self.primal_orders = primal_orders
         self.dual_orders = dual_orders
         self.levels = levels
@@ -671,6 +670,7 @@ class BsplineWaveletControlSpace(BsplineControlSpace):
         self.construct_wavelet_transform_matrices()
         super().__init__(mesh, bbox, primal_orders, levels, fixed_dims,
                          boundary_regularities)
+        self.threshold = threshold
 
     def construct_1d_interpolation_matrices(self, V):
         """
@@ -718,9 +718,9 @@ class BsplineWaveletControlSpace(BsplineControlSpace):
             x = x_int.vector().get_local()
             for idx in range(n):
                 coeffs = T[:, idx]
-                b = BSpline(knots, coeffs, order - 1)
+                b = BSpline(knots, coeffs, order - 1, extrapolate=False)
 
-                values = b(x)
+                values = np.nan_to_num(b(x))
                 rows = np.where(values != 0)[0].astype(np.int32)
                 values = values[rows]
                 rows_is = PETSc.IS().createGeneral(rows)
@@ -737,10 +737,11 @@ class BsplineWaveletControlSpace(BsplineControlSpace):
     def construct_wavelet_transform_matrices(self):
         self.WT = []
 
-        for dim in range(len(self.primal_orders)):
-            d = self.d = self.primal_orders[dim]
-            d_t = self.d_t = self.dual_orders[dim]
+        for d, d_t, J in zip(self.primal_orders, self.dual_orders,
+                             self.levels):
             assert (d + d_t) % 2 == 0
+            self.d = d
+            self.d_t = d_t
 
             self.compute_primal_refinement_coeffs()
             self.compute_dual_refinement_coeffs()
@@ -748,9 +749,8 @@ class BsplineWaveletControlSpace(BsplineControlSpace):
             self.construct_dual_ML()
 
             j0 = ceil(log2(d + 2 * d_t - 3) + 1)  # minimal level
-            J = self.levels[dim]
             assert J > j0
-            T = 2**(J / 2) * np.identity(2**J + d - 1)
+            T = np.identity(2**J + d - 1)
             for j in range(j0, J):
                 Tj = self.construct_refinement_matrix(j)
                 m, n = Tj.shape
@@ -1010,6 +1010,30 @@ class BsplineWaveletControlSpace(BsplineControlSpace):
 
         M1 = P @ H_hat_inv @ F_hat
         return M0, M1
+
+    def restrict(self, residual, out):
+        with residual.dat.vec as w:
+            self.FullIFW.multTranspose(w, out.vec_wo())
+        if self.threshold is not None:
+            w_array = out.vec_ro().array[:]
+            # threshold = self.threshold * np.max(np.abs(w_array))
+            # threshold = np.abs(w_array[np.argsort(np.abs(w_array))[-100]])
+            # w_array[np.abs(w_array) < threshold] = 0.
+            wnorm = np.linalg.norm(w_array)**2
+            w_sorted_ind = np.argsort(-np.abs(w_array))
+            sum = 0.
+            i = 0
+            w_filtered = np.zeros_like(w_array)
+            while sum / wnorm < self.threshold:
+                curr_i = w_sorted_ind[i]
+                a = w_array[curr_i]
+                sum += a**2
+                w_filtered[curr_i] = a
+                i += 1
+            print("filtered {:.2f} entries".format(1 - i / w_array.size))
+            w_array = w_filtered
+            out.vec_wo().setValues(range(w_array.size), w_array)
+            out.vec_wo().assemble()
 
 
 class ControlVector(ROL.Vector):
