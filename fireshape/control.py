@@ -756,6 +756,11 @@ class BsplineWaveletControlSpace(BsplineControlSpace):
                 m, n = Tj.shape
                 T[:m, :n] = T[:m, :n] @ Tj
             T[np.abs(T) < 1e-12] = 0.
+
+            # normalize
+            T[:, :2**j0 + d - 1] /= 2**j0 + 1
+            for j in range(j0, J):
+                T[:, 2**j+d-1:2**(j+1)+d-1] /= 2**j + 1
             self.WT.append(T)
 
         del self.d, self.l1, self.l2, self.a, self.ML, \
@@ -1023,14 +1028,17 @@ class BsplineWaveletControlSpace(BsplineControlSpace):
             w_sorted_ind = np.argsort(-np.abs(w_array))
             sum = 0.
             i = 0
+            curr_i = w_sorted_ind[i]
+            a = w_array[curr_i]
+            sum += a**2
             w_filtered = np.zeros_like(w_array)
             while sum / wnorm < self.threshold:
+                w_filtered[curr_i] = a
+                i += 1
                 curr_i = w_sorted_ind[i]
                 a = w_array[curr_i]
                 sum += a**2
-                w_filtered[curr_i] = a
-                i += 1
-            print("filtered {:.2f} entries".format(1 - i / w_array.size))
+            print("filtered {:.2f} entries".format(1 - (i-1) / w_array.size))
             w_array = w_filtered
             out.vec_wo().setValues(range(w_array.size), w_array)
             out.vec_wo().assemble()
