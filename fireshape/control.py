@@ -663,14 +663,23 @@ class BsplineWaveletControlSpace(BsplineControlSpace):
 
     def __init__(self, mesh, bbox, primal_orders, dual_orders, levels,
                  fixed_dims=[], boundary_regularities=None, threshold=None):
-        self.primal_orders = primal_orders
-        self.dual_orders = dual_orders
-        self.levels = levels
-        self.boundary_regularities = boundary_regularities
-        self.construct_wavelet_transform_matrices()
+        self.construct_wavelet_transform_matrices(
+            primal_orders, dual_orders, levels)
         super().__init__(mesh, bbox, primal_orders, levels, fixed_dims,
                          boundary_regularities)
         self.threshold = threshold
+
+        # global indices of scaling functions on coarsest level
+        # columns of IFW
+        def kron_ind(len1, len2):
+            n0_1, n_1 = len1
+            n0_2, n_2 = len2
+            res = np.arange(n0_1)[:, None] * n_2 + np.arange(n0_2)[None, :]
+            return res.reshape(-1)
+        ind = reduce(kron_ind, self.n_coarsest)
+        # columns of FullIFW
+        ind = ind[:, None] * self.dim + np.arange(self.dim)[None, :]
+        self.coarsest_indices = ind.reshape(-1)
 
     def construct_1d_interpolation_matrices(self, V):
         """
@@ -734,11 +743,12 @@ class BsplineWaveletControlSpace(BsplineControlSpace):
         # from IPython import embed; embed()
         return interp_1d
 
-    def construct_wavelet_transform_matrices(self):
+    def construct_wavelet_transform_matrices(self, primal_orders,
+                                             dual_orders, levels):
         self.WT = []
+        self.n_coarsest = []
 
-        for d, d_t, J in zip(self.primal_orders, self.dual_orders,
-                             self.levels):
+        for d, d_t, J in zip(primal_orders, dual_orders, levels):
             assert (d + d_t) % 2 == 0
             self.d = d
             self.d_t = d_t
@@ -750,6 +760,7 @@ class BsplineWaveletControlSpace(BsplineControlSpace):
 
             j0 = ceil(log2(d + 2 * d_t - 3) + 1)  # minimal level
             assert J > j0
+            self.n_coarsest.append((2**j0 + d - 1, 2**J + d - 1))
             T = np.identity(2**J + d - 1)
             for j in range(j0, J):
                 Tj = self.construct_refinement_matrix(j)
@@ -1016,14 +1027,50 @@ class BsplineWaveletControlSpace(BsplineControlSpace):
         M1 = P @ H_hat_inv @ F_hat
         return M0, M1
 
+    def construct_kronecker_matrix(self, interp_1d):
+        """
+        Construct the tensorized interpolation matrix.
+
+        Do this by computing the kron product of the rows of
+        the 1d univariate interpolation matrices.
+        In the future, this may be done matrix-free.
+        """
+        # this is one of the two bottlenecks that slow down initiating Bsplines
+        IFW = PETSc.Mat().create(self.comm)
+        IFW.setType(PETSc.Mat.Type.AIJ)
+
+        comm = self.comm
+        # owned part of global problem
+        local_N = self.N // comm.size + int(comm.rank < (self.N % comm.size))
+        (lsize, gsize) = interp_1d[0].getSizes()[0]
+        IFW.setSizes(((lsize, gsize), (local_N, self.N)))
+
+        # (over)estimate sparsity pattern from interp_1d
+        for row in range(lsize):
+            row = self.lg_map_fe.apply([row])[0]
+            nnz_ = reduce(lambda x, y: x * y,
+                          [len(interp_1d[dim].getRow(row)[0])
+                           for dim in range(self.dim)])  # length of nnz-array
+            self.IFWnnz = max(self.IFWnnz, nnz_)
+        IFW.setPreallocationNNZ(self.IFWnnz)
+        IFW.setUp()
+
+        for row in range(lsize):
+            row = self.lg_map_fe.apply([row])[0]
+            M = [[A.getRow(row)[0],
+                  A.getRow(row)[1], A.getSize()[1]] for A in interp_1d]
+            M = reduce(self.vectorkron, M)
+            columns, values, lenght = M
+            IFW.setValues([row], columns, values)
+
+        IFW.assemble()
+        return IFW
+
     def restrict(self, residual, out):
         with residual.dat.vec as w:
             self.FullIFW.multTranspose(w, out.vec_wo())
         if self.threshold is not None:
             w_array = out.vec_ro().array[:]
-            # threshold = self.threshold * np.max(np.abs(w_array))
-            # threshold = np.abs(w_array[np.argsort(np.abs(w_array))[-100]])
-            # w_array[np.abs(w_array) < threshold] = 0.
             wnorm = np.linalg.norm(w_array)**2
             w_sorted_ind = np.argsort(-np.abs(w_array))
             sum = 0.
@@ -1032,7 +1079,10 @@ class BsplineWaveletControlSpace(BsplineControlSpace):
             a = w_array[curr_i]
             sum += a**2
             w_filtered = np.zeros_like(w_array)
-            while sum / wnorm < self.threshold:
+            # keep scaling functions on coarsest level
+            w_filtered[self.coarsest_indices] = w_array[self.coarsest_indices]
+            eta = self.threshold**2
+            while sum / wnorm < eta:
                 w_filtered[curr_i] = a
                 i += 1
                 curr_i = w_sorted_ind[i]

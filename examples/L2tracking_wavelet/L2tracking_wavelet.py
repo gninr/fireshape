@@ -13,7 +13,7 @@ dual_orders = [2, 2]
 levels = [5, 5]
 Q = fs.BsplineWaveletControlSpace(
     mesh, bbox, primal_orders, dual_orders, levels,
-    boundary_regularities=[0, 0], threshold=0.8)
+    boundary_regularities=[0, 0], threshold=0.9)
 inner = fs.H1InnerProduct(Q)
 q = fs.ControlVector(Q, inner)
 
