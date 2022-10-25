@@ -92,34 +92,14 @@ class UflInnerProduct(InnerProduct):
         # and set up a ksp solver for self.riesz_map
         if I_interp is not None:
             self.interpolated = True
-            ITAI = self.A.PtAP(I_interp)
-            from firedrake.petsc import PETSc
-            import numpy as np
-            zero_rows = []
+            self.A0 = self.A
+            self.update_A(V, I_interp)
 
-            # if there are zero-rows, replace them with rows that
-            # have 1 on the diagonal entry
-            for row in range(*ITAI.getOwnershipRange()):
-                (cols, vals) = ITAI.getRow(row)
-                valnorm = np.linalg.norm(vals)
-                if valnorm < 1e-13:
-                    zero_rows.append(row)
-            for row in zero_rows:
-                ITAI.setValue(row, row, 1.0)
-            ITAI.assemble()
-
-            # overwrite the self.A created by get_impl
-            self.A = ITAI
-
-            # create ksp solver for self.riesz_map
-            Aksp = PETSc.KSP().create(comm=V.comm)
-            Aksp.setOperators(ITAI)
-            Aksp.setType("preonly")
-            Aksp.pc.setType("cholesky")
-            Aksp.pc.setFactorSolverType("mumps")
-            Aksp.setFromOptions()
-            Aksp.setUp()
-            self.Aksp = Aksp
+        self.adaptive = False
+        if hasattr(Q, "adaptive"):
+            self.A0 = self.A
+            self.interpolated = True
+            self.adaptive = True
 
     def get_params(self):
         """PETSc parameters to solve linear system."""
@@ -162,9 +142,40 @@ class UflInnerProduct(InnerProduct):
         out: ControlVector, in the primal space
         """
         if self.interpolated:
+            if self.adaptive:
+                (V, I_interp) = self.Q.get_space_for_inner()
+                self.update_A(V, I_interp)
             self.Aksp.solve(v.vec_ro(), out.vec_wo())
         else:
             self.ls.solve(out.fun, v.fun)
+
+    def update_A(self, V, I_interp):
+        ITAI = self.A0.PtAP(I_interp)
+        zero_rows = []
+
+        # if there are zero-rows, replace them with rows that
+        # have 1 on the diagonal entry
+        for row in range(*ITAI.getOwnershipRange()):
+            (cols, vals) = ITAI.getRow(row)
+            valnorm = np.linalg.norm(vals)
+            if valnorm < 1e-13:
+                zero_rows.append(row)
+        for row in zero_rows:
+            ITAI.setValue(row, row, 1.0)
+        ITAI.assemble()
+
+        # overwrite the self.A created by get_impl
+        self.A = ITAI
+
+        # create ksp solver for self.riesz_map
+        Aksp = PETSc.KSP().create(comm=V.comm)
+        Aksp.setOperators(ITAI)
+        Aksp.setType("preonly")
+        Aksp.pc.setType("cholesky")
+        Aksp.pc.setFactorSolverType("mumps")
+        Aksp.setFromOptions()
+        Aksp.setUp()
+        self.Aksp = Aksp
 
 
 class H1InnerProduct(UflInnerProduct):

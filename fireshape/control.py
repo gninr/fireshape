@@ -6,7 +6,7 @@ import firedrake as fd
 
 __all__ = ["FeControlSpace", "FeMultiGridControlSpace",
            "BsplineControlSpace", "BsplineWaveletControlSpace",
-           "ControlVector"]
+           "AdaptiveWaveletControlSpace", "ControlVector"]
 
 # new imports for splines
 from firedrake.petsc import PETSc
@@ -662,11 +662,11 @@ class BsplineWaveletControlSpace(BsplineControlSpace):
     """ControlSpace based on cartesian tensorized Bspline wavelets."""
 
     def __init__(self, mesh, bbox, primal_orders, dual_orders, levels,
-                 fixed_dims=[], boundary_regularities=None, threshold=None):
+                 fixed_dims=[], threshold=None):
         self.construct_wavelet_transform_matrices(
             primal_orders, dual_orders, levels)
         super().__init__(mesh, bbox, primal_orders, levels, fixed_dims,
-                         boundary_regularities)
+                         boundary_regularities=[0] * len(bbox))
         self.threshold = threshold
 
         # global indices of scaling functions on coarsest level
@@ -674,11 +674,11 @@ class BsplineWaveletControlSpace(BsplineControlSpace):
         def kron_ind(len1, len2):
             n0_1, n_1 = len1
             n0_2, n_2 = len2
-            res = np.arange(n0_1)[:, None] * n_2 + np.arange(n0_2)[None, :]
+            res = np.arange(n0_1).reshape(-1, 1) * n_2 + np.arange(n0_2)
             return res.reshape(-1)
-        ind = reduce(kron_ind, self.n_coarsest)
+        ind = reduce(kron_ind, self.n_j0)
         # columns of FullIFW
-        ind = ind[:, None] * self.dim + np.arange(self.dim)[None, :]
+        ind = ind.reshape(-1, 1) * self.dim + np.arange(self.dim)
         self.coarsest_indices = ind.reshape(-1)
 
     def construct_1d_interpolation_matrices(self, V):
@@ -746,7 +746,7 @@ class BsplineWaveletControlSpace(BsplineControlSpace):
     def construct_wavelet_transform_matrices(self, primal_orders,
                                              dual_orders, levels):
         self.WT = []
-        self.n_coarsest = []
+        self.n_j0 = []
 
         for d, d_t, J in zip(primal_orders, dual_orders, levels):
             assert (d + d_t) % 2 == 0
@@ -760,7 +760,7 @@ class BsplineWaveletControlSpace(BsplineControlSpace):
 
             j0 = ceil(log2(d + 2 * d_t - 3) + 1)  # minimal level
             assert J > j0
-            self.n_coarsest.append((2**j0 + d - 1, 2**J + d - 1))
+            self.n_j0.append((2**j0 + d - 1, 2**J + d - 1))
             T = np.identity(2**J + d - 1)
             for j in range(j0, J):
                 Tj = self.construct_refinement_matrix(j)
@@ -1088,10 +1088,204 @@ class BsplineWaveletControlSpace(BsplineControlSpace):
                 curr_i = w_sorted_ind[i]
                 a = w_array[curr_i]
                 sum += a**2
-            print("filtered {:.2f} entries".format(1 - (i-1) / w_array.size))
+            print("filtered {:.2%} entries".format(1 - (i-1) / w_array.size))
             w_array = w_filtered
             out.vec_wo().setValues(range(w_array.size), w_array)
             out.vec_wo().assemble()
+
+
+class AdaptiveWaveletControlSpace(BsplineWaveletControlSpace):
+    """ControlSpace based on adaptive cartesian tensorized Bspline wavelets."""
+
+    def __init__(self, mesh, bbox, primal_orders, dual_orders, max_levels,
+                 fixed_dims=[], tol=1e-8, threshold=0.9):
+        self.adaptive = True
+        self.boundary_regularities = [0] * len(bbox)
+        self.dim = len(bbox)
+        self.bbox = bbox
+        self.orders = primal_orders
+        self.dual_orders = dual_orders
+        self.levels = max_levels
+        if isinstance(fixed_dims, int):
+            fixed_dims = [fixed_dims]
+        self.fixed_dims = fixed_dims
+        self.tol = tol
+        self.threshold = threshold
+        self.construct_knots()
+        self.comm = mesh.mpi_comm()
+        # create temporary self.mesh_r and self.V_r to assemble innerproduct
+        if self.dim == 2:
+            nx = len(self.knots[0]) - 1
+            ny = len(self.knots[1]) - 1
+            Lx = self.bbox[0][1] - self.bbox[0][0]
+            Ly = self.bbox[1][1] - self.bbox[1][0]
+            meshloc = fd.RectangleMesh(nx, ny, Lx, Ly, quadrilateral=True,
+                                       comm=self.comm)  # quads or triangle?
+            # shift in x- and y-direction
+            meshloc.coordinates.dat.data[:, 0] += self.bbox[0][0]
+            meshloc.coordinates.dat.data[:, 1] += self.bbox[1][0]
+            # inner_product.fixed_bids = [1,2,3,4]
+
+        elif self.dim == 3:
+            # maybe use extruded meshes, quadrilateral not available
+            nx = len(self.knots[0]) - 1
+            ny = len(self.knots[1]) - 1
+            nz = len(self.knots[2]) - 1
+            Lx = self.bbox[0][1] - self.bbox[0][0]
+            Ly = self.bbox[1][1] - self.bbox[1][0]
+            Lz = self.bbox[2][1] - self.bbox[2][0]
+            meshloc = fd.BoxMesh(nx, ny, nz, Lx, Ly, Lz, comm=self.comm)
+            # shift in x-, y-, and z-direction
+            meshloc.coordinates.dat.data[:, 0] += self.bbox[0][0]
+            meshloc.coordinates.dat.data[:, 1] += self.bbox[1][0]
+            meshloc.coordinates.dat.data[:, 2] += self.bbox[2][0]
+            # inner_product.fixed_bids = [1,2,3,4,5,6]
+
+        self.meshloc = meshloc
+        maxdegree = max(self.orders) - 1
+
+        # Wavelet control space
+        self.V_control = fd.VectorFunctionSpace(meshloc, "CG", maxdegree)
+        self.I_control = None
+
+        # standard construction of ControlSpace
+        self.mesh_r = mesh
+        element = fd.VectorElement("CG", mesh.ufl_cell(), maxdegree)
+        self.V_r = fd.FunctionSpace(self.mesh_r, element)
+        X = fd.SpatialCoordinate(self.mesh_r)
+        self.id = fd.Function(self.V_r).interpolate(X)
+        self.T = fd.Function(self.V_r, name="T")
+        self.T.assign(self.id)
+        self.mesh_m = fd.Mesh(self.T)
+        self.V_m = fd.FunctionSpace(self.mesh_m, element)
+
+        assert self.dim == self.mesh_r.geometric_dimension()
+
+        self.construct_wavelet_transform_matrices(
+            primal_orders, dual_orders, max_levels)
+        self.FullIFW = None
+        self.Told = fd.Function(self.V_r, name="T")
+        self.Told.assign(self.id)
+
+    def restrict(self, residual, out):
+        self.build_bases(residual)
+        mesh_r = self.mesh_r
+        self.mesh_r = self.meshloc
+        self.I_control = self.build_interpolation_matrix(self.V_control)
+        self.mesh_r = mesh_r
+        self.FullIFW = self.build_interpolation_matrix(self.V_r)
+        out.data = self.get_zero_vec()
+        with residual.dat.vec as w:
+            self.FullIFW.multTranspose(w, out.vec_wo())
+
+    def build_bases(self, residual):
+        self.bases = []
+        self.n = []
+
+        def single_level_knots(order, level, xlim):
+            knots_01 = np.concatenate((np.zeros((order - 1,), dtype=float),
+                                       np.linspace(0., 1., 2**level + 1),
+                                       np.ones((order - 1,), dtype=float)))
+            (xmin, xmax) = xlim
+            return (xmax - xmin) * knots_01 + xmin
+
+        with residual.dat.vec as w:
+            for dim in range(self.dim):
+                v = w.array[dim::self.dim]
+                basis = []
+
+                d = self.orders[dim]
+                d_t = self.dual_orders[dim]
+                xlim = self.bbox[dim]
+                j0 = ceil(log2(d + 2 * d_t - 3) + 1)
+
+                j = 0
+                knots = single_level_knots(d, j, xlim)
+                coeffs = np.ones(knots.shape, dtype=float)
+                b = BSpline(knots, coeffs, d - 1, extrapolate=False)
+                basis.append(b)
+
+                while j < self.levels[dim]:
+                    j += 1
+
+                self.bases.append(basis)
+                self.n.append(len(basis))
+
+        # dimension of multivariate spline space
+        N = reduce(lambda x, y: x * y, self.n)
+        self.N = N
+
+    def construct_1d_interpolation_matrices(self, V):
+        interp_1d = []
+
+        x_fct = fd.SpatialCoordinate(self.mesh_r)
+        x_int = fd.interpolate(x_fct[0], V.sub(0))
+        self.M = x_int.vector().size()
+
+        comm = self.comm
+
+        u, v = fd.TrialFunction(V.sub(0)), fd.TestFunction(V.sub(0))
+        mass_temp = fd.assemble(u * v * fd.dx)
+        self.lg_map_fe = mass_temp.petscmat.getLGMap()[0]
+
+        for dim in range(self.dim):
+            n = self.n[dim]
+            local_n = n // comm.size + int(comm.rank < (n % comm.size))
+            I = PETSc.Mat().create(comm=self.comm)
+            I.setType(PETSc.Mat.Type.AIJ)
+            lsize = x_int.vector().local_size()
+            gsize = x_int.vector().size()
+            I.setSizes(((lsize, gsize), (local_n, n)))
+
+            I.setUp()
+            basis = self.bases[dim]
+            x_int = fd.interpolate(x_fct[dim], V.sub(0))
+            x = x_int.vector().get_local()
+            for idx in range(n):
+                values = np.nan_to_num(basis[idx](x))
+                rows = np.where(values != 0)[0].astype(np.int32)
+                values = values[rows]
+                rows_is = PETSc.IS().createGeneral(rows)
+                global_rows_is = self.lg_map_fe.applyIS(rows_is)
+                rows = global_rows_is.array
+                I.setValues(rows, [idx], values)
+
+            I.assemble()
+            interp_1d.append(I)
+
+        return interp_1d
+
+    def get_zero_vec(self):
+        if self.FullIFW is not None:
+            vec = self.FullIFW.createVecRight()
+            return vec
+        else:
+            return None
+
+    def update_domain(self, q: 'ControlVector'):
+        # initialize
+        if self.I_control is None:
+            return True
+
+        if not hasattr(self, 'lastq') or self.lastq is None \
+           or self.lastq.vec_ro().size != q.vec_ro().size:
+            self.lastq = q.clone()
+            self.lastq.set(q)
+        else:
+            self.lastq.axpy(-1., q)
+            # calculate l2 norm (faster)
+            diff = self.lastq.vec_ro().norm()
+            self.lastq.axpy(+1., q)
+            if diff < 1e-20:
+                self.Told.assign(self.T)
+                return False
+            else:
+                self.lastq.set(q)
+        dT = fd.Function(self.T)
+        q.to_coordinatefield(dT)
+        self.T.assign(self.Told)
+        self.T += dT
+        return True
 
 
 class ControlVector(ROL.Vector):
@@ -1121,6 +1315,10 @@ class ControlVector(ROL.Vector):
             self.fun = data
         else:
             self.fun = None
+
+        self.adaptive = False
+        if hasattr(controlspace, "adaptive"):
+            self.adaptive = True
 
     def from_first_derivative(self, fe_deriv):
         if self.boundary_extension is not None:
@@ -1193,8 +1391,14 @@ class ControlVector(ROL.Vector):
         vec.axpy(alpha, x.vec_ro())
 
     def set(self, v):
-        vec = self.vec_wo()
-        v.vec_ro().copy(vec)
+        if not self.adaptive:
+            vec = self.vec_wo()
+            v.vec_ro().copy(vec)
+        elif v.vec_ro() is not None:
+            vec = self.vec_wo()
+            if vec is None:
+                self.data = self.controlspace.get_zero_vec()
+            v.vec_ro().copy(vec)
 
     def __str__(self):
         """String representative, so we can call print(vec)."""

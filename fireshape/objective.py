@@ -61,6 +61,9 @@ class Objective(ROL.Objective):
         self.derivative(g)
         g.apply_riesz_map()
 
+        if x.adaptive:
+            x.data = self.Q.get_zero_vec()
+
     def update(self, x, flag, iteration):
         """Update physical domain and possibly store current iterate."""
         self.Q.update_domain(x)

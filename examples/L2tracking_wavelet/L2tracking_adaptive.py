@@ -10,9 +10,9 @@ mesh = fd.Mesh("mesh.msh")
 bbox = [(-3., -1.), (-1., 1.)]
 primal_orders = [2, 2]
 dual_orders = [2, 2]
-levels = [5, 5]
-Q = fs.BsplineWaveletControlSpace(
-    mesh, bbox, primal_orders, dual_orders, levels, threshold=0.9)
+max_levels = [5, 5]
+Q = fs.AdaptiveWaveletControlSpace(
+    mesh, bbox, primal_orders, dual_orders, max_levels)
 inner = fs.H1InnerProduct(Q)
 q = fs.ControlVector(Q, inner)
 
