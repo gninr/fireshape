@@ -12,8 +12,9 @@ primal_orders = [2, 2]
 dual_orders = [2, 2]
 levels = [5, 5]
 Q = fs.BsplineWaveletControlSpace(
-    mesh, bbox, primal_orders, dual_orders, levels, threshold=0.9)
+    mesh, bbox, primal_orders, dual_orders, levels, eta=0.9)
 inner = fs.H1InnerProduct(Q)
+Q.assign_inner_product(inner)
 q = fs.ControlVector(Q, inner)
 
 # Setup PDE constraint

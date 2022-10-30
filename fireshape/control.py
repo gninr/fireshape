@@ -662,24 +662,37 @@ class BsplineWaveletControlSpace(BsplineControlSpace):
     """ControlSpace based on cartesian tensorized Bspline wavelets."""
 
     def __init__(self, mesh, bbox, primal_orders, dual_orders, levels,
-                 fixed_dims=[], threshold=None):
-        self.construct_wavelet_transform_matrices(
-            primal_orders, dual_orders, levels)
+                 fixed_dims=[], eta=None):
+        self.initialized = False
         super().__init__(mesh, bbox, primal_orders, levels, fixed_dims,
                          boundary_regularities=[0] * len(bbox))
-        self.threshold = threshold
+        self.dual_orders = dual_orders
+        self.eta = eta
 
-        # global indices of scaling functions on coarsest level
-        # columns of IFW
-        def kron_ind(len1, len2):
-            n0_1, n_1 = len1
-            n0_2, n_2 = len2
-            res = np.arange(n0_1).reshape(-1, 1) * n_2 + np.arange(n0_2)
-            return res.reshape(-1)
-        ind = reduce(kron_ind, self.n_j0)
-        # columns of FullIFW
-        ind = ind.reshape(-1, 1) * self.dim + np.arange(self.dim)
-        self.coarsest_indices = ind.reshape(-1)
+    def assign_inner_product(self, inner_product):
+        self.inner_product = inner_product
+
+        self.initialized = True
+        self.construct_wavelet_transform_matrices(
+            self.orders, self.dual_orders, self.levels)
+        self.build_interpolation_matrices()
+        self.compute_scaling_function_ind()
+
+        inner_product.interpolated = True
+        inner_product.update_A()
+
+    def build_interpolation_matrices(self):
+        mesh_r = self.mesh_r
+        self.mesh_r = self.V_control.mesh()
+        self.I_control = self.build_interpolation_matrix(self.V_control)
+        self.mesh_r = mesh_r
+        self.FullIFW = self.build_interpolation_matrix(self.V_r)
+
+    def build_interpolation_matrix(self, V):
+        if self.initialized:
+            return super().build_interpolation_matrix(V)
+        else:
+            return None
 
     def construct_1d_interpolation_matrices(self, V):
         """
@@ -746,24 +759,26 @@ class BsplineWaveletControlSpace(BsplineControlSpace):
     def construct_wavelet_transform_matrices(self, primal_orders,
                                              dual_orders, levels):
         self.WT = []
-        self.n_j0 = []
+        self.n_sf = []
 
-        for d, d_t, J in zip(primal_orders, dual_orders, levels):
+        for dim in range(self.dim):
+            d = primal_orders[dim]
+            d_t = dual_orders[dim]
             assert (d + d_t) % 2 == 0
-            self.d = d
-            self.d_t = d_t
 
-            self.compute_primal_refinement_coeffs()
-            self.compute_dual_refinement_coeffs()
-            self.construct_primal_ML()
-            self.construct_dual_ML()
+            a = self.compute_primal_refinement_coeffs(d)
+            a_t = self.compute_dual_refinement_coeffs(d, d_t)
+            ML = self.construct_primal_ML(d)
+            ML_t = self.construct_dual_ML(d, d_t, a, a_t, ML)
 
             j0 = ceil(log2(d + 2 * d_t - 3) + 1)  # minimal level
+            J = levels[dim]
             assert J > j0
-            self.n_j0.append((2**j0 + d - 1, 2**J + d - 1))
+            self.n_sf.append((2**j0 + d - 1, 2**J + d - 1))
             T = np.identity(2**J + d - 1)
             for j in range(j0, J):
-                Tj = self.construct_refinement_matrix(j)
+                Tj = self.construct_refinement_matrix(j, d, d_t, a, a_t, ML,
+                                                      ML_t)
                 m, n = Tj.shape
                 T[:m, :n] = T[:m, :n] @ Tj
             T[np.abs(T) < 1e-12] = 0.
@@ -771,35 +786,36 @@ class BsplineWaveletControlSpace(BsplineControlSpace):
             # normalize
             T[:, :2**j0 + d - 1] /= 2**j0 + 1
             for j in range(j0, J):
-                T[:, 2**j+d-1:2**(j+1)+d-1] /= 2**j + 1
+                T[:, 2**j+d-1:2**(j+1)+d-1] /= \
+                    self.inner_product.get_scaling_factor(j)
             self.WT.append(T)
 
-        del self.d, self.l1, self.l2, self.a, self.ML, \
-            self.d_t, self.l1_t, self.l2_t, self.a_t, self.ML_t
-
-    def construct_refinement_matrix(self, j):
-        M0, M1 = self.initial_completion(j)
-        M0_t = self.construct_dual_refinement_matrix(j)
+    def construct_refinement_matrix(self, j, d, d_t, a, a_t, ML, ML_t):
+        M0, M1 = self.initial_completion(j, d, a, ML)
+        M0_t = self.construct_dual_refinement_matrix(j, d, d_t, a_t, ML_t)
         M1 = M1 - M0 @ M0_t.T @ M1
         return np.hstack((M0, M1))
 
-    def compute_primal_refinement_coeffs(self):
+    def compute_support(self, a):
+        L = len(a) - 1
+        return -floor(L / 2), ceil(L / 2)
+
+    def compute_primal_refinement_coeffs(self, d):
         """
         Compute refinement coefficients of the primal scaling function of
         order d.
         """
-        d = self.d
-        l1 = self.l1 = -floor(d / 2)
-        l2 = self.l2 = ceil(d / 2)
+        l1 = -floor(d / 2)
+        l2 = ceil(d / 2)
 
-        self.a = 2**(1 - d) * \
+        a = 2**(1 - d) * \
             np.array([binom(d, k - l1) for k in range(l1, l2 + 1)])
+        return a
 
-    def construct_primal_ML(self):
+    def construct_primal_ML(self, d):
         """
         Construct the refinement matrix for primal boundary functions.
         """
-        d = self.d
         knots = np.concatenate((np.zeros(d - 1), np.arange(2 * d - 1)))
         x = np.arange(2 * d - 2)
 
@@ -816,31 +832,28 @@ class BsplineWaveletControlSpace(BsplineControlSpace):
             coeffs[k] = 1.
             b = BSpline(knots, coeffs, d - 1)
             B2[:, k] = b(x)
-        self.ML = np.linalg.solve(B2, B1)
+        ML = np.linalg.solve(B2, B1)
+        return ML
 
-    def construct_primal_refinement_matrix(self, j):
-        d = self.d
-
+    def construct_primal_refinement_matrix(self, j, d, a, ML):
         # refinement matrix for primal inner functions
         A = np.zeros((2**(j + 1) - d + 1, 2**j - d + 1))
         for k in range(2**j - d + 1):
-            A[2*k:2*k+d+1, k] = self.a
+            A[2*k:2*k+d+1, k] = a
 
         M0 = np.zeros((2**(j+1) + d - 1, 2**j + d - 1))
-        M0[:2*d-2, :d-1] = self.ML
+        M0[:2*d-2, :d-1] = ML
         M0[d-1:2**(j+1), d-1:2**j] = A
-        M0[-(2*d-2):, -(d-1):] = self.ML[::-1, ::-1]
+        M0[-(2*d-2):, -(d-1):] = ML[::-1, ::-1]
         return M0 / np.sqrt(2)
 
-    def compute_dual_refinement_coeffs(self):
+    def compute_dual_refinement_coeffs(self, d, d_t):
         """
         Compute refinement coefficients of the dual scaling function of
         order d and dual order d_t.
         """
-        d = self.d
-        d_t = self.d_t
-        l1_t = self.l1_t = -floor(d / 2) - d_t + 1
-        l2_t = self.l2_t = ceil(d / 2) + d_t - 1
+        l1_t = -floor(d / 2) - d_t + 1
+        l2_t = ceil(d / 2) + d_t - 1
         K = (d + d_t) // 2
 
         a_t = []
@@ -852,26 +865,20 @@ class BsplineWaveletControlSpace(BsplineControlSpace):
                            * binom(d_t, k + floor(d_t / 2) - i + n) \
                            * binom(K - 1 + n, n) * binom(2 * n, i)
             a_t.append(a_k)
-        self.a_t = np.array(a_t)
+        return np.array(a_t)
 
-    def construct_dual_ML(self):
+    def construct_dual_ML(self, d, d_t, a, a_t, ML):
         """
         Construct the refinement matrix for dual boundary functions.
         """
-        d = self.d
-        d_t = self.d_t
-        l1 = self.l1
-        l2 = self.l2
-        l1_t = self.l1_t
-        l2_t = self.l2_t
-        a = self.a
-        a_t = self.a_t
+        l1, l2 = self.compute_support(a)
+        l1_t, l2_t = self.compute_support(a_t)
 
         # make the size of ML compatible with ML_t
-        ML = np.zeros((2*d + 3*d_t - 5, d + d_t - 2))
-        ML[:2*d-2, :d-1] = self.ML
+        ML_full = np.zeros((2*d + 3*d_t - 5, d + d_t - 2))
+        ML_full[:2*d-2, :d-1] = ML
         for k in range(d-1, d+d_t-2):
-            ML[2*k-d+1:2*k+2, k] = self.a
+            ML_full[2*k-d+1:2*k+2, k] = a
         ML_t = np.zeros((2*d + 3*d_t - 5, d + d_t - 2))
 
         # Compute block of ML_t corresponding to k = d-2, ..., d+2*d_t-3
@@ -910,7 +917,7 @@ class BsplineWaveletControlSpace(BsplineControlSpace):
         D1 = np.zeros((d_t, d_t))
         D2 = np.zeros((d_t, d_t))
         D3 = np.zeros((d_t, d_t))
-        k0 = -self.l1_t - 1
+        k0 = -l1_t - 1
         for n in range(d_t):
             for k in range(n+1):
                 D1[n, k] = binom(n, k) * alpha0[n - k]
@@ -928,9 +935,9 @@ class BsplineWaveletControlSpace(BsplineControlSpace):
         # Compute block of ML_t corresponding to k = 0, ..., d-3
 
         def compute_gramian():
-            n = ML.shape[1]
-            UL = ML[:n, :]
-            LL = ML[n:, :]
+            n = ML_full.shape[1]
+            UL = ML_full[:n, :]
+            LL = ML_full[n:, :]
             UL_t = ML_t[:n, :]
             LL_t = ML_t[n:, :]
             lhs = 2 * np.identity(n**2) - np.kron(UL_t.T, UL.T)
@@ -941,7 +948,7 @@ class BsplineWaveletControlSpace(BsplineControlSpace):
         gramian_full = np.identity(2*d + 3*d_t - 5)
         for k in range(d - 3, -1, -1):
             gramian_full[:d+d_t-2, :d+d_t-2] = compute_gramian()
-            B_k = ML[:, :k+d].T @ gramian_full[:, k+1:2*k+d+1] / 2.
+            B_k = ML_full[:, :k+d].T @ gramian_full[:, k+1:2*k+d+1] / 2.
 
             delta = np.zeros(k+d)
             delta[k] = 1
@@ -952,37 +959,30 @@ class BsplineWaveletControlSpace(BsplineControlSpace):
         gramian = compute_gramian()
         ML_t[:d+d_t-2, :d+d_t-2] = gramian @ ML_t[:d+d_t-2, :d+d_t-2]
         ML_t = ML_t @ np.linalg.inv(gramian)
+        return ML_t
 
-        self.ML_t = ML_t
-
-    def construct_dual_refinement_matrix(self, j):
-        d = self.d
-        d_t = self.d_t
-
+    def construct_dual_refinement_matrix(self, j, d, d_t, a_t, ML_t):
         # refinement matrix for dual inner functions
         A_t = np.zeros((2**(j+1) - d - 2*d_t + 3, 2**j - d - 2*d_t + 3))
         for k in range(2**j - d - 2*d_t + 3):
-            A_t[2*k:2*k+d+2*d_t-1, k] = self.a_t
+            A_t[2*k:2*k+d+2*d_t-1, k] = a_t
 
         M0_t = np.zeros((2**(j + 1) + d - 1, 2**j + d - 1))
-        M0_t[:2*d+3*d_t-5, :d+d_t-2] = self.ML_t
+        M0_t[:2*d+3*d_t-5, :d+d_t-2] = ML_t
         M0_t[d+d_t-2:2**(j+1)-d_t+1, d+d_t-2:2**j-d_t+1] = A_t
-        M0_t[-(2*d+3*d_t-5):, -(d+d_t-2):] = self.ML_t[::-1, ::-1]
+        M0_t[-(2*d+3*d_t-5):, -(d+d_t-2):] = ML_t[::-1, ::-1]
         return M0_t / np.sqrt(2)
 
-    def initial_completion(self, j):
-        d = self.d
-        l1 = self.l1
-        l2 = self.l2
+    def initial_completion(self, j, d, a, ML):
+        l1, l2 = self.compute_support(a)
         p = 2**j - d + 1
         q = 2**(j + 1) - d + 1
 
-        ML = self.ML
         P = np.identity(q + 2*d - 2)
         P[:2*d-2, :d-1] = ML / np.sqrt(2)
         P[-(2*d-2):, -(d-1):] = ML[::-1, ::-1] / np.sqrt(2)
 
-        M0 = self.construct_primal_refinement_matrix(j)
+        M0 = self.construct_primal_refinement_matrix(j, d, a, ML)
         A = M0[d-1:q+d-1, d-1:p+d-1]
         H_inv = np.identity(q)
         for i in range(d):
@@ -1066,119 +1066,72 @@ class BsplineWaveletControlSpace(BsplineControlSpace):
         IFW.assemble()
         return IFW
 
+    def compute_scaling_function_ind(self):
+        # global indices of scaling functions on coarsest level
+        # columns of IFW
+        def kron_ind(len1, len2):
+            n0_1, n_1 = len1
+            n0_2, n_2 = len2
+            res = np.arange(n0_1).reshape(-1, 1) * n_2 + np.arange(n0_2)
+            return res.reshape(-1)
+        ind = reduce(kron_ind, self.n_sf)
+        # columns of FullIFW
+        ind = ind.reshape(-1, 1) * self.dim + np.arange(self.dim)
+        self.ind_sf = ind.reshape(-1)
+
     def restrict(self, residual, out):
         with residual.dat.vec as w:
             self.FullIFW.multTranspose(w, out.vec_wo())
-        if self.threshold is not None:
-            w_array = out.vec_ro().array[:]
-            wnorm = np.linalg.norm(w_array)**2
-            w_sorted_ind = np.argsort(-np.abs(w_array))
-            sum = 0.
-            i = 0
+        if self.eta is not None:
+            self.thresholding(out)
+
+    def thresholding(self, vector):
+        w_array = vector.vec_ro().array[:]
+        wnorm = np.linalg.norm(w_array)**2
+        w_sorted_ind = np.argsort(-np.abs(w_array))
+        sum = 0.
+        i = 0
+        curr_i = w_sorted_ind[i]
+        a = w_array[curr_i]
+        sum += a**2
+        w_filtered = np.zeros_like(w_array)
+        # keep scaling functions on coarsest level
+        w_filtered[self.ind_sf] = w_array[self.ind_sf]
+        eta_sq = self.eta**2
+        while sum / wnorm < eta_sq:
+            w_filtered[curr_i] = a
+            i += 1
             curr_i = w_sorted_ind[i]
             a = w_array[curr_i]
             sum += a**2
-            w_filtered = np.zeros_like(w_array)
-            # keep scaling functions on coarsest level
-            w_filtered[self.coarsest_indices] = w_array[self.coarsest_indices]
-            eta = self.threshold**2
-            while sum / wnorm < eta:
-                w_filtered[curr_i] = a
-                i += 1
-                curr_i = w_sorted_ind[i]
-                a = w_array[curr_i]
-                sum += a**2
-            print("filtered {:.2%} entries".format(1 - (i-1) / w_array.size))
-            w_array = w_filtered
-            out.vec_wo().setValues(range(w_array.size), w_array)
-            out.vec_wo().assemble()
+        print("filtered {:.2%} entries".format(1 - (i-1) / w_array.size))
+        w_array = w_filtered
+        vector.vec_wo().setValues(range(w_array.size), w_array)
+        vector.vec_wo().assemble()
 
 
 class AdaptiveWaveletControlSpace(BsplineWaveletControlSpace):
     """ControlSpace based on adaptive cartesian tensorized Bspline wavelets."""
 
-    def __init__(self, mesh, bbox, primal_orders, dual_orders, max_levels,
-                 fixed_dims=[], tol=1e-8, threshold=0.9):
-        self.adaptive = True
-        self.boundary_regularities = [0] * len(bbox)
-        self.dim = len(bbox)
-        self.bbox = bbox
-        self.orders = primal_orders
-        self.dual_orders = dual_orders
-        self.levels = max_levels
-        if isinstance(fixed_dims, int):
-            fixed_dims = [fixed_dims]
-        self.fixed_dims = fixed_dims
+    def __init__(self, mesh, bbox, primal_orders, dual_orders, min_levels,
+                 max_levels, fixed_dims=[], tol=1e-5, eta=None):
+        super().__init__(mesh, bbox, primal_orders, dual_orders, max_levels,
+                         fixed_dims, eta)
+        self.min_levels = min_levels
         self.tol = tol
-        self.threshold = threshold
-        self.construct_knots()
-        self.comm = mesh.mpi_comm()
-        # create temporary self.mesh_r and self.V_r to assemble innerproduct
-        if self.dim == 2:
-            nx = len(self.knots[0]) - 1
-            ny = len(self.knots[1]) - 1
-            Lx = self.bbox[0][1] - self.bbox[0][0]
-            Ly = self.bbox[1][1] - self.bbox[1][0]
-            meshloc = fd.RectangleMesh(nx, ny, Lx, Ly, quadrilateral=True,
-                                       comm=self.comm)  # quads or triangle?
-            # shift in x- and y-direction
-            meshloc.coordinates.dat.data[:, 0] += self.bbox[0][0]
-            meshloc.coordinates.dat.data[:, 1] += self.bbox[1][0]
-            # inner_product.fixed_bids = [1,2,3,4]
 
-        elif self.dim == 3:
-            # maybe use extruded meshes, quadrilateral not available
-            nx = len(self.knots[0]) - 1
-            ny = len(self.knots[1]) - 1
-            nz = len(self.knots[2]) - 1
-            Lx = self.bbox[0][1] - self.bbox[0][0]
-            Ly = self.bbox[1][1] - self.bbox[1][0]
-            Lz = self.bbox[2][1] - self.bbox[2][0]
-            meshloc = fd.BoxMesh(nx, ny, nz, Lx, Ly, Lz, comm=self.comm)
-            # shift in x-, y-, and z-direction
-            meshloc.coordinates.dat.data[:, 0] += self.bbox[0][0]
-            meshloc.coordinates.dat.data[:, 1] += self.bbox[1][0]
-            meshloc.coordinates.dat.data[:, 2] += self.bbox[2][0]
-            # inner_product.fixed_bids = [1,2,3,4,5,6]
-
-        self.meshloc = meshloc
-        maxdegree = max(self.orders) - 1
-
-        # Wavelet control space
-        self.V_control = fd.VectorFunctionSpace(meshloc, "CG", maxdegree)
-        self.I_control = None
-
-        # standard construction of ControlSpace
-        self.mesh_r = mesh
-        element = fd.VectorElement("CG", mesh.ufl_cell(), maxdegree)
-        self.V_r = fd.FunctionSpace(self.mesh_r, element)
-        X = fd.SpatialCoordinate(self.mesh_r)
-        self.id = fd.Function(self.V_r).interpolate(X)
-        self.T = fd.Function(self.V_r, name="T")
-        self.T.assign(self.id)
-        self.mesh_m = fd.Mesh(self.T)
-        self.V_m = fd.FunctionSpace(self.mesh_m, element)
-
-        assert self.dim == self.mesh_r.geometric_dimension()
-
-        self.construct_wavelet_transform_matrices(
-            primal_orders, dual_orders, max_levels)
-        self.FullIFW = None
-        self.Told = fd.Function(self.V_r, name="T")
-        self.Told.assign(self.id)
+        self.updated = False
 
     def restrict(self, residual, out):
-        self.build_bases(residual)
-        mesh_r = self.mesh_r
-        self.mesh_r = self.meshloc
-        self.I_control = self.build_interpolation_matrix(self.V_control)
-        self.mesh_r = mesh_r
-        self.FullIFW = self.build_interpolation_matrix(self.V_r)
-        out.data = self.get_zero_vec()
-        with residual.dat.vec as w:
-            self.FullIFW.multTranspose(w, out.vec_wo())
+        super().restrict(residual, out)
+        if out.norm() < self.tol_iter:
+            self.update_bases(residual)
+            self.build_interpolation_matrices()
+            self.update_control_vector(out)
+            out.innerproduct.update_A(self.V_control, self.I_control)
+            self.updated = True
 
-    def build_bases(self, residual):
+    def update_bases(self, residual):
         self.bases = []
         self.n = []
 
@@ -1199,11 +1152,23 @@ class AdaptiveWaveletControlSpace(BsplineWaveletControlSpace):
                 xlim = self.bbox[dim]
                 j0 = ceil(log2(d + 2 * d_t - 3) + 1)
 
+                
                 j = 0
                 knots = single_level_knots(d, j, xlim)
                 coeffs = np.ones(knots.shape, dtype=float)
                 b = BSpline(knots, coeffs, d - 1, extrapolate=False)
                 basis.append(b)
+                
+                """
+                j = self.levels[dim]
+                knots = self.knots[dim]
+                n = self.n[dim]
+                T = self.WT[dim]
+                for idx in range(n):
+                    coeffs = T[:, idx]
+                    b = BSpline(knots, coeffs, d-1, extrapolate=False)
+                    basis.append(b)
+                """
 
                 while j < self.levels[dim]:
                     j += 1
@@ -1255,37 +1220,11 @@ class AdaptiveWaveletControlSpace(BsplineWaveletControlSpace):
 
         return interp_1d
 
-    def get_zero_vec(self):
-        if self.FullIFW is not None:
-            vec = self.FullIFW.createVecRight()
-            return vec
-        else:
-            return None
-
-    def update_domain(self, q: 'ControlVector'):
-        # initialize
-        if self.I_control is None:
-            return True
-
-        if not hasattr(self, 'lastq') or self.lastq is None \
-           or self.lastq.vec_ro().size != q.vec_ro().size:
-            self.lastq = q.clone()
-            self.lastq.set(q)
-        else:
-            self.lastq.axpy(-1., q)
-            # calculate l2 norm (faster)
-            diff = self.lastq.vec_ro().norm()
-            self.lastq.axpy(+1., q)
-            if diff < 1e-20:
-                self.Told.assign(self.T)
-                return False
-            else:
-                self.lastq.set(q)
-        dT = fd.Function(self.T)
-        q.to_coordinatefield(dT)
-        self.T.assign(self.Told)
-        self.T += dT
-        return True
+    def update_control_vector(self, x: 'ControlVector'):
+        xold = x.data
+        x.data = self.get_zero_vec()
+        x.data.setValues(range(self.filtered_ind.size),
+                         xold[self.filtered_ind])
 
 
 class ControlVector(ROL.Vector):
@@ -1315,10 +1254,6 @@ class ControlVector(ROL.Vector):
             self.fun = data
         else:
             self.fun = None
-
-        self.adaptive = False
-        if hasattr(controlspace, "adaptive"):
-            self.adaptive = True
 
     def from_first_derivative(self, fe_deriv):
         if self.boundary_extension is not None:
@@ -1391,14 +1326,8 @@ class ControlVector(ROL.Vector):
         vec.axpy(alpha, x.vec_ro())
 
     def set(self, v):
-        if not self.adaptive:
-            vec = self.vec_wo()
-            v.vec_ro().copy(vec)
-        elif v.vec_ro() is not None:
-            vec = self.vec_wo()
-            if vec is None:
-                self.data = self.controlspace.get_zero_vec()
-            v.vec_ro().copy(vec)
+        vec = self.vec_wo()
+        v.vec_ro().copy(vec)
 
     def __str__(self):
         """String representative, so we can call print(vec)."""

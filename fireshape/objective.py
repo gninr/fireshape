@@ -1,6 +1,6 @@
 import ROL
 import firedrake as fd
-from .control import ControlSpace
+from .control import AdaptiveWaveletControlSpace, ControlSpace
 from .pde_constraint import PdeConstraint
 
 
@@ -61,8 +61,9 @@ class Objective(ROL.Objective):
         self.derivative(g)
         g.apply_riesz_map()
 
-        if x.adaptive:
-            x.data = self.Q.get_zero_vec()
+        if isinstance(self.Q, AdaptiveWaveletControlSpace) and self.Q.updated:
+            self.Q.update_control_vector(x)
+            self.Q.updated = False
 
     def update(self, x, flag, iteration):
         """Update physical domain and possibly store current iterate."""

@@ -86,20 +86,14 @@ class UflInnerProduct(InnerProduct):
                              nullspace=nsp, transpose_nullspace=nsp)
         self.ls = ls
         self.A = A.petscmat
+        self.A0 = self.A
         self.interpolated = False
 
         # If the matrix I is passed, replace A with transpose(I)*A*I
         # and set up a ksp solver for self.riesz_map
         if I_interp is not None:
             self.interpolated = True
-            self.A0 = self.A
-            self.update_A(V, I_interp)
-
-        self.adaptive = False
-        if hasattr(Q, "adaptive"):
-            self.A0 = self.A
-            self.interpolated = True
-            self.adaptive = True
+            self.update_A()
 
     def get_params(self):
         """PETSc parameters to solve linear system."""
@@ -142,14 +136,12 @@ class UflInnerProduct(InnerProduct):
         out: ControlVector, in the primal space
         """
         if self.interpolated:
-            if self.adaptive:
-                (V, I_interp) = self.Q.get_space_for_inner()
-                self.update_A(V, I_interp)
             self.Aksp.solve(v.vec_ro(), out.vec_wo())
         else:
             self.ls.solve(out.fun, v.fun)
 
-    def update_A(self, V, I_interp):
+    def update_A(self):
+        V, I_interp = self.Q.get_space_for_inner()
         ITAI = self.A0.PtAP(I_interp)
         zero_rows = []
 
@@ -177,6 +169,9 @@ class UflInnerProduct(InnerProduct):
         Aksp.setUp()
         self.Aksp = Aksp
 
+    def get_scaling_factor(self, j):
+        raise NotImplementedError
+
 
 class H1InnerProduct(UflInnerProduct):
     """Inner product on H1. It involves stiffness and mass matrices."""
@@ -190,6 +185,9 @@ class H1InnerProduct(UflInnerProduct):
 
     def get_nullspace(self, V):
         return None
+
+    def get_scaling_factor(self, j):
+        return 1 + 2**j
 
 
 class LaplaceInnerProduct(UflInnerProduct):
@@ -215,6 +213,9 @@ class LaplaceInnerProduct(UflInnerProduct):
         else:
             raise NotImplementedError
         return res
+
+    def get_scaling_factor(self, j):
+        return 2**j
 
 
 class ElasticityInnerProduct(UflInnerProduct):
