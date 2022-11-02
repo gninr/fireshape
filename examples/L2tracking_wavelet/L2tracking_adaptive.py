@@ -10,11 +10,13 @@ mesh = fd.Mesh("mesh.msh")
 bbox = [(-3., -1.), (-1., 1.)]
 primal_orders = [2, 2]
 dual_orders = [2, 2]
-max_levels = [5, 5]
-Q = fs.AdaptiveWaveletControlSpace(
-    mesh, bbox, primal_orders, dual_orders, max_levels)
+min_level = 2
+max_level = 5
+Q = fs.AdaptiveWaveletControlSpace(mesh, bbox, primal_orders, dual_orders,
+                                   min_level, max_level, tol=1e-3, eta=0.9)
 inner = fs.H1InnerProduct(Q)
-q = fs.ControlVector(Q, inner)
+Q.assign_inner_product(inner)
+q = fs.AdaptiveControlVector(Q, inner)
 
 # Setup PDE constraint
 rt = 0.5

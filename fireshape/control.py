@@ -4,13 +4,14 @@ from .innerproduct import InnerProduct
 import ROL
 import firedrake as fd
 
-__all__ = ["FeControlSpace", "FeMultiGridControlSpace",
-           "BsplineControlSpace", "BsplineWaveletControlSpace",
-           "AdaptiveWaveletControlSpace", "ControlVector"]
+__all__ = ["FeControlSpace", "FeMultiGridControlSpace", "BsplineControlSpace",
+           "BsplineWaveletControlSpace", "AdaptiveWaveletControlSpace",
+           "ControlVector", "AdaptiveControlVector"]
 
 # new imports for splines
 from firedrake.petsc import PETSc
 from functools import reduce
+from itertools import product
 from scipy.interpolate import BSpline, splev
 from scipy.special import binom
 import numpy as np
@@ -668,18 +669,53 @@ class BsplineWaveletControlSpace(BsplineControlSpace):
                          boundary_regularities=[0] * len(bbox))
         self.dual_orders = dual_orders
         self.eta = eta
+        self.free_dims = list(set(range(self.dim)) - set(self.fixed_dims))
+        self.dfree = len(self.free_dims)
 
     def assign_inner_product(self, inner_product):
         self.inner_product = inner_product
+        self.precompute()
 
         self.initialized = True
-        self.construct_wavelet_transform_matrices(
-            self.orders, self.dual_orders, self.levels)
         self.build_interpolation_matrices()
-        self.compute_scaling_function_ind()
 
         inner_product.interpolated = True
         inner_product.update_A()
+
+    def precompute(self):
+        self.WT = []
+        self.n_sf = []
+
+        for dim in range(self.dim):
+            d = self.orders[dim]
+            d_t = self.dual_orders[dim]
+            assert (d + d_t) % 2 == 0
+
+            a = self.compute_primal_refinement_coeffs(d)
+            a_t = self.compute_dual_refinement_coeffs(d, d_t)
+            ML = self.construct_primal_ML(d)
+            ML_t = self.construct_dual_ML(d, d_t, a, a_t, ML)
+
+            j0 = ceil(log2(d + 2 * d_t - 3) + 1)  # minimal level
+            J = self.levels[dim]
+            assert J > j0
+            self.n_sf.append(2**j0 + d - 1)
+            T = np.identity(2**J + d - 1)
+            for j in range(j0, J):
+                M0_j, M1_j = self.construct_refinement_matrix(
+                    j, d, d_t, a, a_t, ML, ML_t)
+                Tj = np.hstack((M0_j, M1_j))
+                m, n = Tj.shape
+                T[:m, :n] = T[:m, :n] @ Tj
+            T[np.abs(T) < 1e-12] = 0.
+
+            # normalize
+            T[:, :2**j0 + d - 1] /= self.inner_product.get_scaling_factor(j0)
+            for j in range(j0, J):
+                T[:, 2**j+d-1:2**(j+1)+d-1] /= \
+                    self.inner_product.get_scaling_factor(j)
+            self.WT.append(T)
+        self.compute_scaling_function_ind()
 
     def build_interpolation_matrices(self):
         mesh_r = self.mesh_r
@@ -756,45 +792,11 @@ class BsplineWaveletControlSpace(BsplineControlSpace):
         # from IPython import embed; embed()
         return interp_1d
 
-    def construct_wavelet_transform_matrices(self, primal_orders,
-                                             dual_orders, levels):
-        self.WT = []
-        self.n_sf = []
-
-        for dim in range(self.dim):
-            d = primal_orders[dim]
-            d_t = dual_orders[dim]
-            assert (d + d_t) % 2 == 0
-
-            a = self.compute_primal_refinement_coeffs(d)
-            a_t = self.compute_dual_refinement_coeffs(d, d_t)
-            ML = self.construct_primal_ML(d)
-            ML_t = self.construct_dual_ML(d, d_t, a, a_t, ML)
-
-            j0 = ceil(log2(d + 2 * d_t - 3) + 1)  # minimal level
-            J = levels[dim]
-            assert J > j0
-            self.n_sf.append((2**j0 + d - 1, 2**J + d - 1))
-            T = np.identity(2**J + d - 1)
-            for j in range(j0, J):
-                Tj = self.construct_refinement_matrix(j, d, d_t, a, a_t, ML,
-                                                      ML_t)
-                m, n = Tj.shape
-                T[:m, :n] = T[:m, :n] @ Tj
-            T[np.abs(T) < 1e-12] = 0.
-
-            # normalize
-            T[:, :2**j0 + d - 1] /= 2**j0 + 1
-            for j in range(j0, J):
-                T[:, 2**j+d-1:2**(j+1)+d-1] /= \
-                    self.inner_product.get_scaling_factor(j)
-            self.WT.append(T)
-
     def construct_refinement_matrix(self, j, d, d_t, a, a_t, ML, ML_t):
         M0, M1 = self.initial_completion(j, d, a, ML)
         M0_t = self.construct_dual_refinement_matrix(j, d, d_t, a_t, ML_t)
         M1 = M1 - M0 @ M0_t.T @ M1
-        return np.hstack((M0, M1))
+        return M0, M1
 
     def compute_support(self, a):
         L = len(a) - 1
@@ -1069,122 +1071,130 @@ class BsplineWaveletControlSpace(BsplineControlSpace):
     def compute_scaling_function_ind(self):
         # global indices of scaling functions on coarsest level
         # columns of IFW
-        def kron_ind(len1, len2):
+        def ind_kron(len1, len2):
             n0_1, n_1 = len1
             n0_2, n_2 = len2
             res = np.arange(n0_1).reshape(-1, 1) * n_2 + np.arange(n0_2)
             return res.reshape(-1)
-        ind = reduce(kron_ind, self.n_sf)
+        ind = reduce(ind_kron, zip(self.n_sf, self.n))
         # columns of FullIFW
-        ind = ind.reshape(-1, 1) * self.dim + np.arange(self.dim)
+        ind = ind.reshape(-1, 1) * self.dfree + np.arange(self.dfree)
         self.ind_sf = ind.reshape(-1)
 
     def restrict(self, residual, out):
         with residual.dat.vec as w:
             self.FullIFW.multTranspose(w, out.vec_wo())
         if self.eta is not None:
-            self.thresholding(out)
+            v = out.vec_ro().array
+            mask = np.full_like(v, False, dtype=bool)
+            for d in range(self.dfree):
+                v_1d = v[d::self.dfree]
+                mask_1d = self.coarse(v_1d)
+                mask[d::self.dfree] = mask_1d
+            mask[self.ind_sf] = True
+            out.vec_wo().setValues(np.where(~mask)[0].astype(np.int32),
+                                   np.zeros((~mask).sum()))
+            out.vec_wo().assemble()
 
-    def thresholding(self, vector):
-        w_array = vector.vec_ro().array[:]
-        wnorm = np.linalg.norm(w_array)**2
-        w_sorted_ind = np.argsort(-np.abs(w_array))
-        sum = 0.
-        i = 0
-        curr_i = w_sorted_ind[i]
-        a = w_array[curr_i]
-        sum += a**2
-        w_filtered = np.zeros_like(w_array)
-        # keep scaling functions on coarsest level
-        w_filtered[self.ind_sf] = w_array[self.ind_sf]
+    def coarse(self, v):
+        mask = np.full_like(v, False, dtype=bool)
         eta_sq = self.eta**2
-        while sum / wnorm < eta_sq:
-            w_filtered[curr_i] = a
-            i += 1
-            curr_i = w_sorted_ind[i]
-            a = w_array[curr_i]
+        norm_sq = np.linalg.norm(v)**2
+        ind_sorted = np.argsort(-np.abs(v))
+        sum = 0.
+        for i in range(v.size):
+            ii = ind_sorted[i]
+            a = v[ii]
             sum += a**2
-        print("filtered {:.2%} entries".format(1 - (i-1) / w_array.size))
-        w_array = w_filtered
-        vector.vec_wo().setValues(range(w_array.size), w_array)
-        vector.vec_wo().assemble()
+            if sum / norm_sq > eta_sq:
+                break
+            mask[ii] = True
+        print("filtered {:.2%} entries".format(1 - mask.sum() / v.size))
+        return mask
 
 
 class AdaptiveWaveletControlSpace(BsplineWaveletControlSpace):
     """ControlSpace based on adaptive cartesian tensorized Bspline wavelets."""
 
-    def __init__(self, mesh, bbox, primal_orders, dual_orders, min_levels,
-                 max_levels, fixed_dims=[], tol=1e-5, eta=None):
-        super().__init__(mesh, bbox, primal_orders, dual_orders, max_levels,
+    def __init__(self, mesh, bbox, primal_orders, dual_orders, min_level,
+                 max_level, fixed_dims=[], tol=1e-4, eta=None,
+                 start_from_const=True):
+        levels = [max_level] * len(bbox)
+        super().__init__(mesh, bbox, primal_orders, dual_orders, levels,
                          fixed_dims, eta)
-        self.min_levels = min_levels
+        self.min_level = min_level
+        self.max_level = max_level
         self.tol = tol
+        self.j = min_level
+        if start_from_const:
+            self.j -= 1
 
         self.updated = False
 
-    def restrict(self, residual, out):
-        super().restrict(residual, out)
-        if out.norm() < self.tol_iter:
-            self.update_bases(residual)
-            self.build_interpolation_matrices()
-            self.update_control_vector(out)
-            out.innerproduct.update_A(self.V_control, self.I_control)
-            self.updated = True
-
-    def update_bases(self, residual):
-        self.bases = []
-        self.n = []
-
-        def single_level_knots(order, level, xlim):
-            knots_01 = np.concatenate((np.zeros((order - 1,), dtype=float),
-                                       np.linspace(0., 1., 2**level + 1),
-                                       np.ones((order - 1,), dtype=float)))
-            (xmin, xmax) = xlim
-            return (xmax - xmin) * knots_01 + xmin
-
-        with residual.dat.vec as w:
-            for dim in range(self.dim):
-                v = w.array[dim::self.dim]
-                basis = []
-
-                d = self.orders[dim]
-                d_t = self.dual_orders[dim]
-                xlim = self.bbox[dim]
-                j0 = ceil(log2(d + 2 * d_t - 3) + 1)
-
-                
-                j = 0
-                knots = single_level_knots(d, j, xlim)
-                coeffs = np.ones(knots.shape, dtype=float)
-                b = BSpline(knots, coeffs, d - 1, extrapolate=False)
-                basis.append(b)
-                
-                """
-                j = self.levels[dim]
-                knots = self.knots[dim]
-                n = self.n[dim]
-                T = self.WT[dim]
-                for idx in range(n):
-                    coeffs = T[:, idx]
-                    b = BSpline(knots, coeffs, d-1, extrapolate=False)
-                    basis.append(b)
-                """
-
-                while j < self.levels[dim]:
-                    j += 1
-
-                self.bases.append(basis)
-                self.n.append(len(basis))
-
-        # dimension of multivariate spline space
-        N = reduce(lambda x, y: x * y, self.n)
-        self.N = N
-
-    def construct_1d_interpolation_matrices(self, V):
-        interp_1d = []
-
+    def precompute(self):
+        V = self.V_r
         x_fct = fd.SpatialCoordinate(self.mesh_r)
+        self.xs = [fd.interpolate(x_fct[dim], V.sub(0)).vector()
+                   for dim in range(self.dim)]
+
+        self.j0 = self.min_level
+        for dim in range(self.dim):
+            d = self.orders[dim]
+            d_t = self.dual_orders[dim]
+            assert (d + d_t) % 2 == 0
+
+            j0 = ceil(log2(d + 2 * d_t - 3) + 1)  # minimal level of wavelet
+            self.j0 = max(self.j0, j0)
+        assert self.max_level > self.j0
+
+        self.mra = []
+        for dim in range(self.dim):
+            mra = MRA(
+                self, self.orders[dim], self.dual_orders[dim], self.min_level,
+                self.max_level, j0, self.bbox[dim], self.inner_product)
+            self.mra.append(mra)
+        self.construct_basis(self.j)
+
+    def construct_basis(self, j):
+        basis_1d = []
+        n = 1
+        for dim in range(self.dim):
+            b = self.mra[dim].get_scaling_functions(j)
+            basis_1d.append(b)
+            n *= len(b)
+        basis = [BasisFunction(b) for b in product(*basis_1d)]
+        self.bases = [basis] * self.dfree
+        self.n = [n] * self.dfree
+        self.N = n * self.dfree
+        self.shift = np.arange(self.dfree) * n
+
+    def compute_scaling_function_ind(self):
+        self.ind_sf = np.empty(0)
+        for d in range(self.dfree):
+            ind = np.arange(self.n_sf[d]) + self.shift[d]
+            np.concatenate((self.ind_sf, ind))
+
+    def build_interpolation_matrix(self, V):
+        if self.initialized:
+            interp = self.construct_interpolation_matrices(V)
+            self.FullIFWnnz = 0
+            return self.construct_full_interpolation_matrix(interp)
+        else:
+            return None
+
+    def construct_interpolation_matrices(self, V):
+        """
+        Create a list of sparse matrices (one per free dimension of self.V_r).
+        """
+        interp = []
+
+        # this code is correct but can be made more beautiful
+        # by replacing x_fct with self.id
+        x_fct = fd.SpatialCoordinate(self.mesh_r)  # used for x_int
+        # compute self.M, x_int will be overwritten below
         x_int = fd.interpolate(x_fct[0], V.sub(0))
+        lsize = x_int.vector().local_size()
+        gsize = x_int.vector().size()
         self.M = x_int.vector().size()
 
         comm = self.comm
@@ -1193,21 +1203,24 @@ class AdaptiveWaveletControlSpace(BsplineWaveletControlSpace):
         mass_temp = fd.assemble(u * v * fd.dx)
         self.lg_map_fe = mass_temp.petscmat.getLGMap()[0]
 
+        xs = []
         for dim in range(self.dim):
-            n = self.n[dim]
+            x_int = fd.interpolate(x_fct[dim], V.sub(0))
+            xs.append(x_int.vector().get_local())
+
+        for d in range(self.dfree):
+            basis = self.bases[d]
+            n = self.n[d]
+
+            # owned part of global problem
             local_n = n // comm.size + int(comm.rank < (n % comm.size))
             I = PETSc.Mat().create(comm=self.comm)
             I.setType(PETSc.Mat.Type.AIJ)
-            lsize = x_int.vector().local_size()
-            gsize = x_int.vector().size()
             I.setSizes(((lsize, gsize), (local_n, n)))
-
             I.setUp()
-            basis = self.bases[dim]
-            x_int = fd.interpolate(x_fct[dim], V.sub(0))
-            x = x_int.vector().get_local()
+
             for idx in range(n):
-                values = np.nan_to_num(basis[idx](x))
+                values = basis[idx](xs)
                 rows = np.where(values != 0)[0].astype(np.int32)
                 values = values[rows]
                 rows_is = PETSc.IS().createGeneral(rows)
@@ -1216,15 +1229,270 @@ class AdaptiveWaveletControlSpace(BsplineWaveletControlSpace):
                 I.setValues(rows, [idx], values)
 
             I.assemble()
-            interp_1d.append(I)
+            interp.append(I)
 
-        return interp_1d
+        return interp
+
+    def construct_full_interpolation_matrix(self, interp):
+        FullIFW = PETSc.Mat().create(self.comm)
+        FullIFW.setType(PETSc.Mat.Type.AIJ)
+
+        # set proper matrix sizes
+        dim = self.dim
+        lsize_spline_full = 0
+        gsize_spline_full = 0
+        for I in interp:
+            ((lsize, gsize), (lsize_spline, gsize_spline)) = I.getSizes()
+            lsize_spline_full += lsize_spline
+            gsize_spline_full += gsize_spline
+        FullIFW.setSizes(((dim * lsize, dim * gsize),
+                          (lsize_spline_full, gsize_spline_full)))
+
+        # (over)estimate sparsity pattern using row with most nonzeros
+        global_rows = self.lg_map_fe.apply([range(lsize)])
+        for row in range(lsize):
+            row = global_rows[row]
+            for I in interp:
+                self.FullIFWnnz = max(self.FullIFWnnz, len(I.getRow(row)[1]))
+        FullIFW.setPreallocationNNZ(self.FullIFWnnz)
+
+        # preallocate matrix
+        FullIFW.setUp()
+
+        # fill matrix by entries from interp
+        for i, d in enumerate(self.free_dims):
+            for row in range(lsize):
+                row = global_rows[row]
+                (cols, vals) = interp[i].getRow(row)
+                FullIFW.setValues([dim * row + d],       # global row
+                                  cols + self.shift[i],  # global column
+                                  vals)
+
+        FullIFW.assemble()
+        return FullIFW
+
+    def restrict(self, residual, out):
+        with residual.dat.vec as w:
+            self.FullIFW.multTranspose(w, out.vec_wo())
+        if self.j < self.max_level and \
+           np.linalg.norm(out.data.array) < self.tol:
+            print("refine level", self.j)
+            self.update_bases(residual, out)
+            self.build_interpolation_matrices()
+            out.data = self.get_zero_vec()
+            with residual.dat.vec as w:
+                self.FullIFW.multTranspose(w, out.vec_wo())
+            self.inner_product.update_A()
+            self.updated = True
+
+    def update_bases(self, residual, out):
+        self.n_old = self.n
+        self.shift_old = self.shift
+        if self.j < self.j0:
+            self.construct_basis(self.j + 1)
+        else:
+            v = out.data.array
+            self.n = []
+            self.shift = [0]
+            with residual.dat.vec as w:
+                for d in range(self.dfree):
+                    basis = self.bases[d]
+
+                    children = []
+                    for b in basis:
+                        children.extend(b.get_children(self.j)[1:])
+                    children = list(set(children))
+
+                    nc = len(children)
+                    interp_children = np.empty((self.M, nc))
+                    for i in range(nc):
+                        interp_children[:, i] = children[i](self.xs)
+                    dim = self.free_dims[d]
+                    vc = interp_children.T @ w.array[dim::self.dim]
+
+                    n = self.n_old[d]
+                    shift = self.shift_old[d]
+                    v_1d = v[shift:shift + n]
+                    if self.eta is not None:
+                        maskc = self.coarse(np.concatenate((v_1d, vc)))[n:]
+                        children = np.array(children)[maskc]
+                        children = list(children)
+
+                    basis.extend(children)
+                    n += len(children)
+                    self.n.append(n)
+                    self.shift.append(self.shift[-1] + n)
+                    print("added", len(children), "basis functions")
+
+                    self.compute_scaling_function_ind()
+            self.N = self.shift[-1]
+
+        self.j += 1
+        if self.j == self.j0:
+            self.n_sf = self.n
 
     def update_control_vector(self, x: 'ControlVector'):
-        xold = x.data
+        x_old = x.data.array
         x.data = self.get_zero_vec()
-        x.data.setValues(range(self.filtered_ind.size),
-                         xold[self.filtered_ind])
+        for d in range(self.dfree):
+            n = self.n_old[d]
+            shift = self.shift_old[d]
+            x_1d = x_old[shift:shift + n]
+
+            if self.j <= self.j0:
+                refine_mats = [self.mra[dim].refine(self.j - 1, 0)
+                               for dim in range(self.dim)]
+                x_1d = reduce(np.kron, refine_mats) @ x_1d
+                n = self.n[d]
+            shift = self.shift[d]
+            x.data.setValues(np.arange(n).astype(np.int32) + shift, x_1d)
+
+
+class MRA(object):
+    def __init__(self, Q, d, d_t, min_level, max_level, j0, xlim,
+                 inner_product):
+        assert min_level <= j0
+        self.Q = Q
+        self.order = d
+        self.min_level = min_level
+        self.max_level = max_level
+        self.j0 = j0
+        self.xlim = xlim
+        self.inner_product = inner_product
+
+        a = Q.compute_primal_refinement_coeffs(d)
+        a_t = Q.compute_dual_refinement_coeffs(d, d_t)
+        ML = Q.construct_primal_ML(d)
+        ML_t = Q.construct_dual_ML(d, d_t, a, a_t, ML)
+
+        self.knots = []
+        (xmin, xmax) = xlim
+        for j in range(min_level, max_level + 1):
+            knots_01 = np.concatenate((np.zeros((d - 1,), dtype=float),
+                                       np.linspace(0., 1., 2**j + 1),
+                                       np.ones((d - 1,), dtype=float)))
+            self.knots.append((xmax - xmin) * knots_01 + xmin)
+
+        self.M0 = []
+        self.scalings = []
+        for j in range(min_level, j0 + 1):
+            if j < j0:
+                # refinement matrix for scaling functions
+                M0 = Q.construct_primal_refinement_matrix(j, d, a, ML)
+                M0 *= inner_product.get_scaling_factor(j + 1) / \
+                    inner_product.get_scaling_factor(j)
+                self.M0.append(M0)
+            scalings = [BasisFunction1D(0, j, k, self)
+                        for k in range(2**j + d - 1)]
+            self.scalings.append(scalings)
+
+        self.M1 = []
+        self.wavelets = []
+        for j in range(j0, max_level):
+            # refinement matrix for wavelets
+            _, M1 = Q.construct_refinement_matrix(
+                j, d, d_t, a, a_t, ML, ML_t)
+            M1 *= inner_product.get_scaling_factor(j + 1) / \
+                inner_product.get_scaling_factor(j)
+            self.M1.append(M1)
+            wavelets = [BasisFunction1D(1, j, k, self)
+                        for k in range(2**j)]
+            self.wavelets.append(wavelets)
+
+    def get_knots(self, j):
+        return self.knots[j - self.min_level]
+
+    def refine(self, j, e):
+        """Refine space of level j."""
+        assert e == (j >= self.j0)
+
+        if j == self.min_level - 1:
+            n = self.M0[0].shape[1]
+            return np.ones((n, 1))
+
+        if j < self.j0:
+            return self.M0[j - self.min_level]
+        else:
+            return self.M1[j - self.j0]
+
+    def get_scaling_functions(self, j):
+        if j == self.min_level - 1:
+            return [BasisFunction1D(0, j, 0, self)]
+
+        return self.scalings[j - self.min_level]
+
+    def get_wavelets(self, j):
+        return self.wavelets[j - self.j0]
+
+
+class BasisFunction1D(object):
+    def __init__(self, e, j, k, mra):
+        self.e = e
+        self.j = j
+        self.k = k
+        self.mra = mra
+
+        d = mra.order
+        min_level = mra.min_level
+        if j == min_level - 1:
+            knots = mra.get_knots(j + 1)
+            factor = mra.inner_product.get_scaling_factor(min_level)
+            coeffs = np.full_like(knots, 1. / factor)
+            # support on [0, 1]
+            self.support = (0., 1.)
+        elif e == 0:
+            knots = mra.get_knots(j)
+            coeffs = np.zeros_like(knots)
+            coeffs[k] = 2**(j/2) / self.mra.inner_product.get_scaling_factor(j)
+            # support on [0, 1]
+            self.support = (max(0., 2**(-j) * (k + 1 - d)),
+                            min(1., 2**(-j) * (k + 1)))
+        else:
+            knots = mra.get_knots(j + 1)
+            coeffs = 2**((j+1)/2) * mra.refine(j, 1)[:, k] / \
+                self.mra.inner_product.get_scaling_factor(j + 1)
+            sf = np.where(coeffs != 0)[0]
+            # support on [0, 1]
+            self.support = (max(0., 2**(-j-1) * (sf[0] + 1 - d)),
+                            min(1., 2**(-j-1) * (sf[-1] + 1)))
+
+        self.spline = BSpline(knots, coeffs, d - 1, extrapolate=False)
+
+    def __hash__(self):
+        return hash((self.e, self.j, self.k))
+
+    def __call__(self, x):
+        return np.nan_to_num(self.spline(x))
+
+    def get_children(self, j):
+        children = [self]
+        wavelets = self.mra.get_wavelets(j + 1)
+        l10, l20 = self.support
+        for w in wavelets:
+            l1, l2 = w.support
+            if l1 < l20 and l2 > l10:
+                children.append(w)
+        return children
+
+
+class BasisFunction(object):
+    def __init__(self, basis_function_1d):
+        self.basis_function_1d = basis_function_1d
+
+    def __hash__(self):
+        return hash(self.basis_function_1d)
+
+    def spline_kron(self, v, w):
+        b1, x1 = v
+        b2, x2 = w
+        return b1(x1) * b2(x2)
+
+    def __call__(self, xs):
+        return reduce(self.spline_kron, zip(self.basis_function_1d, xs))
+
+    def get_children(self, j):
+        children_1d = [b_1d.get_children(j) for b_1d in self.basis_function_1d]
+        return [BasisFunction(c) for c in product(*children_1d)]
 
 
 class ControlVector(ROL.Vector):
@@ -1332,3 +1600,27 @@ class ControlVector(ROL.Vector):
     def __str__(self):
         """String representative, so we can call print(vec)."""
         return self.vec_ro()[:].__str__()
+
+
+class AdaptiveControlVector(ControlVector):
+    def clone(self):
+        res = AdaptiveControlVector(self.controlspace, self.inner_product,
+                                    boundary_extension=self.boundary_extension)
+        return res
+
+    def dot(self, v):
+        for vec in (self, v):
+            if vec.data.size != self.controlspace.N:
+                self.controlspace.update_control_vector(vec)
+        return super().dot(v)
+
+    def axpy(self, alpha, x):
+        for vec in (self, x):
+            if vec.data.size != self.controlspace.N:
+                self.controlspace.update_control_vector(vec)
+        super().axpy(alpha, x)
+
+    def set(self, v):
+        if self.data.size != self.controlspace.N:
+            self.data = self.controlspace.get_zero_vec()
+        super().set(v)
