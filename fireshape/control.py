@@ -663,10 +663,10 @@ class BsplineWaveletControlSpace(BsplineControlSpace):
     """ControlSpace based on cartesian tensorized Bspline wavelets."""
 
     def __init__(self, mesh, bbox, primal_orders, dual_orders, levels,
-                 fixed_dims=[], eta=None):
+                 fixed_dims=[], boundary_regularities=None, eta=None):
         self.initialized = False
         super().__init__(mesh, bbox, primal_orders, levels, fixed_dims,
-                         boundary_regularities=[0] * len(bbox))
+                         boundary_regularities)
         self.dual_orders = dual_orders
         self.eta = eta
         self.free_dims = list(set(range(self.dim)) - set(self.fixed_dims))
@@ -699,20 +699,25 @@ class BsplineWaveletControlSpace(BsplineControlSpace):
             j0 = ceil(log2(d + 2 * d_t - 3) + 1)  # minimal level
             J = self.levels[dim]
             assert J > j0
-            self.n_sf.append(2**j0 + d - 1)
-            T = np.identity(2**J + d - 1)
+            n_bdry = self.boundary_regularities[dim]
+            n_sf = 2**j0 + d - 1 - 2 * n_bdry
+            self.n_sf.append(n_sf)
+            T = np.identity(2**J + d - 1 - 2 * n_bdry)
             for j in range(j0, J):
                 M0_j, M1_j = self.construct_refinement_matrix(
                     j, d, d_t, a, a_t, ML, ML_t)
+                if n_bdry > 0:
+                    M0_j = M0_j[n_bdry:-n_bdry, n_bdry:-n_bdry]
+                    M1_j = M1_j[n_bdry:-n_bdry, :]
                 Tj = np.hstack((M0_j, M1_j))
                 m, n = Tj.shape
                 T[:m, :n] = T[:m, :n] @ Tj
             T[np.abs(T) < 1e-12] = 0.
 
             # normalize
-            T[:, :2**j0 + d - 1] /= self.inner_product.get_scaling_factor(j0)
+            T[:, :n_sf] /= self.inner_product.get_scaling_factor(j0)
             for j in range(j0, J):
-                T[:, 2**j+d-1:2**(j+1)+d-1] /= \
+                T[:, 2**j+d-1-2*n_bdry:2**(j+1)+d-1-2*n_bdry] /= \
                     self.inner_product.get_scaling_factor(j)
             self.WT.append(T)
         self.compute_scaling_function_ind()
@@ -762,6 +767,7 @@ class BsplineWaveletControlSpace(BsplineControlSpace):
             knots = self.knots[dim]
             n = self.n[dim]
             T = self.WT[dim]
+            n_bdry = self.boundary_regularities[dim]
 
             # owned part of global problem
             local_n = n // comm.size + int(comm.rank < (n % comm.size))
@@ -775,7 +781,8 @@ class BsplineWaveletControlSpace(BsplineControlSpace):
             x_int = fd.interpolate(x_fct[dim], V.sub(0))
             x = x_int.vector().get_local()
             for idx in range(n):
-                coeffs = T[:, idx]
+                coeffs = np.zeros_like(knots)
+                coeffs[n_bdry:n_bdry+n] = T[:, idx]
                 b = BSpline(knots, coeffs, order - 1, extrapolate=False)
 
                 values = np.nan_to_num(b(x))
@@ -1117,11 +1124,11 @@ class AdaptiveWaveletControlSpace(BsplineWaveletControlSpace):
     """ControlSpace based on adaptive cartesian tensorized Bspline wavelets."""
 
     def __init__(self, mesh, bbox, primal_orders, dual_orders, min_level,
-                 max_level, fixed_dims=[], tol=1e-4, eta=None,
-                 start_from_const=True):
+                 max_level, fixed_dims=[], boundary_regularities=None,
+                 tol=1e-4, eta=None, start_from_const=True):
         levels = [max_level] * len(bbox)
         super().__init__(mesh, bbox, primal_orders, dual_orders, levels,
-                         fixed_dims, eta)
+                         fixed_dims, boundary_regularities, eta)
         self.min_level = min_level
         self.max_level = max_level
         self.tol = tol
@@ -1149,11 +1156,14 @@ class AdaptiveWaveletControlSpace(BsplineWaveletControlSpace):
         assert self.max_level > self.j0
 
         self.mra = []
+        self.n_sf = []
         for dim in range(self.dim):
-            mra = MRA(
-                self, self.orders[dim], self.dual_orders[dim], self.min_level,
-                self.max_level, j0, self.bbox[dim], self.inner_product)
+            n_bdry = self.boundary_regularities[dim]
+            mra = MRA(self, self.orders[dim], self.dual_orders[dim],
+                      self.min_level, self.max_level, j0, self.bbox[dim], 
+                      n_bdry, self.inner_product)
             self.mra.append(mra)
+            self.n_sf.append(2**j0 + d - 1 - 2 * n_bdry)
         self.construct_basis(self.j)
 
     def construct_basis(self, j):
@@ -1337,8 +1347,6 @@ class AdaptiveWaveletControlSpace(BsplineWaveletControlSpace):
                 self.compute_scaling_function_ind()
 
         self.j += 1
-        if self.j == self.j0:
-            self.n_sf = self.n
 
     def update_control_vector(self, x: 'ControlVector'):
         x_old = x.vec_ro()
@@ -1359,7 +1367,7 @@ class AdaptiveWaveletControlSpace(BsplineWaveletControlSpace):
 
 class MRA(object):
     def __init__(self, Q, d, d_t, min_level, max_level, j0, xlim,
-                 inner_product):
+                 n_bdry, inner_product):
         assert min_level <= j0
         self.Q = Q
         self.order = d
@@ -1367,6 +1375,7 @@ class MRA(object):
         self.max_level = max_level
         self.j0 = j0
         self.xlim = xlim
+        self.n_bdry = n_bdry
         self.inner_product = inner_product
 
         a = Q.compute_primal_refinement_coeffs(d)
@@ -1388,11 +1397,13 @@ class MRA(object):
             if j < j0:
                 # refinement matrix for scaling functions
                 M0 = Q.construct_primal_refinement_matrix(j, d, a, ML)
+                if n_bdry > 0:
+                    M0 = M0[n_bdry:-n_bdry, n_bdry:-n_bdry]
                 M0 *= inner_product.get_scaling_factor(j + 1) / \
                     inner_product.get_scaling_factor(j)
                 self.M0.append(M0)
             scalings = [BasisFunction1D(0, j, k, self)
-                        for k in range(2**j + d - 1)]
+                        for k in range(n_bdry, 2**j + d - 1 - n_bdry)]
             self.scalings.append(scalings)
 
         self.M1 = []
@@ -1401,6 +1412,8 @@ class MRA(object):
             # refinement matrix for wavelets
             _, M1 = Q.construct_refinement_matrix(
                 j, d, d_t, a, a_t, ML, ML_t)
+            if n_bdry > 0:
+                M1 = M1[n_bdry:-n_bdry, :]
             M1 *= inner_product.get_scaling_factor(j + 1) / \
                 inner_product.get_scaling_factor(j)
             self.M1.append(M1)
@@ -1416,7 +1429,7 @@ class MRA(object):
         assert e == (j >= self.j0)
 
         if j == self.min_level - 1:
-            n = self.M0[0].shape[1]
+            n = 2**self.min_level + self.order - 1 - 2 * self.n_bdry
             return np.ones((n, 1))
 
         if j < self.j0:
@@ -1441,12 +1454,15 @@ class BasisFunction1D(object):
         self.k = k
         self.mra = mra
 
+        n_bdry = mra.n_bdry
         d = mra.order
         min_level = mra.min_level
         if j == min_level - 1:
-            knots = mra.get_knots(j + 1)
+            knots = mra.get_knots(min_level)
             factor = mra.inner_product.get_scaling_factor(min_level)
-            coeffs = np.full_like(knots, 1. / factor)
+            n = 2**min_level + d - 1 - 2 * n_bdry
+            coeffs = np.zeros_like(knots)
+            coeffs[n_bdry:n_bdry+n] = 2**(min_level/2) / factor
             # support on [0, 1]
             self.support = (0., 1.)
         elif e == 0:
@@ -1458,8 +1474,11 @@ class BasisFunction1D(object):
                             min(1., 2**(-j) * (k + 1)))
         else:
             knots = mra.get_knots(j + 1)
-            coeffs = 2**((j+1)/2) * mra.refine(j, 1)[:, k] / \
+            refine_coeffs = 2**((j+1)/2) * mra.refine(j, 1)[:, k] / \
                 self.mra.inner_product.get_scaling_factor(j + 1)
+            n = refine_coeffs.size
+            coeffs = np.zeros_like(knots)
+            coeffs[n_bdry:n_bdry+n] = refine_coeffs
             sf = np.where(coeffs != 0)[0]
             # support on [0, 1]
             self.support = (max(0., 2**(-j-1) * (sf[0] + 1 - d)),

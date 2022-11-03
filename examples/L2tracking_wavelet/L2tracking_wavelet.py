@@ -8,11 +8,12 @@ from L2tracking_objective import L2trackingObjective
 mesh = fd.Mesh("mesh.msh")
 
 bbox = [(-3., -1.), (-1., 1.)]
-primal_orders = [2, 2]
-dual_orders = [2, 2]
+primal_orders = [3, 3]
+dual_orders = [3, 3]
 levels = [5, 5]
 Q = fs.BsplineWaveletControlSpace(
-    mesh, bbox, primal_orders, dual_orders, levels, eta=0.9)
+    mesh, bbox, primal_orders, dual_orders, levels,
+    boundary_regularities=[1, 1], eta=0.9)
 inner = fs.H1InnerProduct(Q)
 Q.assign_inner_product(inner)
 q = fs.ControlVector(Q, inner)
