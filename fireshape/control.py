@@ -825,19 +825,19 @@ class BsplineWaveletControlSpace(BsplineControlSpace):
         """
         Construct the refinement matrix for primal boundary functions.
         """
-        knots = np.concatenate((np.zeros(d - 1), np.arange(2 * d - 1)))
+        knots = np.concatenate((np.zeros(d - 1), np.arange(3 * d - 3)))
         x = np.arange(2 * d - 2)
 
         B1 = np.empty((2 * d - 2, d - 1))
         B2 = np.empty((2 * d - 2, 2 * d - 2))
         for k in range(d - 1):
-            coeffs = np.zeros(2 * d - 2)
+            coeffs = np.zeros(3 * d - 4)
             coeffs[k] = 1.
             b = BSpline(knots, coeffs, d - 1)
             B1[:, k] = b(x / 2)
             B2[:, k] = b(x)
         for k in range(d - 1, 2 * d - 2):
-            coeffs = np.zeros(2 * d - 2)
+            coeffs = np.zeros(3 * d - 4)
             coeffs[k] = 1.
             b = BSpline(knots, coeffs, d - 1)
             B2[:, k] = b(x)
@@ -1088,21 +1088,6 @@ class BsplineWaveletControlSpace(BsplineControlSpace):
         ind = ind.reshape(-1, 1) * self.dfree + np.arange(self.dfree)
         self.ind_sf = ind.reshape(-1)
 
-    def restrict(self, residual, out):
-        with residual.dat.vec as w:
-            self.FullIFW.multTranspose(w, out.vec_wo())
-        if self.eta is not None:
-            v = out.vec_ro()
-            mask = np.full_like(v, False, dtype=bool)
-            for d in range(self.dfree):
-                v_1d = v[d::self.dfree]
-                mask_1d = self.coarse(v_1d)
-                mask[d::self.dfree] = mask_1d
-            mask[self.ind_sf] = True
-            out.vec_wo().setValues(np.where(~mask)[0].astype(np.int32),
-                                   np.zeros((~mask).sum()))
-            out.vec_wo().assemble()
-
     def coarse(self, v):
         mask = np.full_like(v, False, dtype=bool)
         eta_sq = self.eta**2
@@ -1116,7 +1101,6 @@ class BsplineWaveletControlSpace(BsplineControlSpace):
             if sum / norm_sq > eta_sq:
                 break
             mask[ii] = True
-        print("filtered {:.2%} entries".format(1 - mask.sum() / v.size))
         return mask
 
 
@@ -1137,7 +1121,6 @@ class AdaptiveWaveletControlSpace(BsplineWaveletControlSpace):
             self.j -= 1
 
         self.adaptive = [True] * self.dfree
-        self.updated = False
 
     def precompute(self):
         V = self.V_r
@@ -1177,7 +1160,7 @@ class AdaptiveWaveletControlSpace(BsplineWaveletControlSpace):
         self.bases = [basis.copy() for _ in range(self.dfree)]
         self.n = [n] * self.dfree
         self.N = n * self.dfree
-        self.shift = np.arange(self.dfree) * n
+        self.shift = np.arange(self.dfree + 1) * n
 
     def compute_scaling_function_ind(self):
         self.ind_sf = np.empty(0)
@@ -1283,70 +1266,74 @@ class AdaptiveWaveletControlSpace(BsplineWaveletControlSpace):
         return FullIFW
 
     def restrict(self, residual, out):
-        with residual.dat.vec as w:
-            self.FullIFW.multTranspose(w, out.vec_wo())
-        if self.j < self.max_level and np.any(self.adaptive) and \
-           np.linalg.norm(out.vec_ro()) < self.tol:
-            print("refine level", self.j)
-            self.update_bases(residual, out)
-            self.build_interpolation_matrices()
-            out.reset()
-            with residual.dat.vec as w:
-                self.FullIFW.multTranspose(w, out.vec_wo())
-            self.inner_product.update_A()
-            self.updated = True
+        self.residual = residual
+        super().restrict(residual, out)
 
-    def update_bases(self, residual, out):
+    def update_bases(self, g):
+        if self.j == self.max_level or not np.any(self.adaptive) or \
+           g.norm() > self.tol:
+            return
+
+        print("refine level", self.j)
         self.n_old = self.n
         self.shift_old = self.shift
         if self.j < self.j0:
             self.construct_basis(self.j + 1)
         else:
-            v = out.vec_ro()
             self.n = []
             self.shift = [0]
-            with residual.dat.vec as w:
-                for d in range(self.dfree):
-                    n = self.n_old[d]
+            for d in range(self.dfree):
+                basis = self.bases[d]
+                if self.adaptive[d]:
+                    children = []
+                    for b in basis:
+                        children.extend(b.get_children(self.j)[1:])
+                    children = list(set(children))
+                    basis.extend(children)
+                n = len(basis)
+                self.n.append(n)
+                self.shift.append(self.shift[-1] + n)
+            self.build_interpolation_matrices()
+            self.inner_product.update_A()
+            g.reset()
+            self.restrict(self.residual, g)
+            g.apply_riesz_map(False)
 
-                    if self.adaptive[d]:
-                        print("free dim", self.free_dims[d])
-                        basis = self.bases[d]
-
-                        children = []
-                        for b in basis:
-                            children.extend(b.get_children(self.j)[1:])
-                        children = list(set(children))
-
-                        nc = len(children)
-                        interp_children = np.empty((self.M, nc))
-                        for i in range(nc):
-                            interp_children[:, i] = children[i](self.xs)
-                        dim = self.free_dims[d]
-                        vc = interp_children.T @ w[dim::self.dim]
-
-                        shift = self.shift_old[d]
-                        v_1d = v[shift:shift + n]
-                        if self.eta is not None:
-                            maskc = self.coarse(np.concatenate((v_1d, vc)))[n:]
-                            children = np.array(children)[maskc]
-                            children = list(children)
-                        basis.extend(children)
-                        nc = len(children)
-                        if nc == 0:
-                            self.adaptive[d] = False
-                        else:
-                            n += nc
-                        print("added", nc, "basis functions")
-
-                    self.n.append(n)
-                    self.shift.append(self.shift[-1] + n)
+            v = g.vec_ro()
+            n_tmp = self.n
+            shift_tmp = self.shift
+            self.n = []
+            self.shift = [0]
+            for d in range(self.dfree):
+                n = n_tmp[d]
+                shift = shift_tmp[d]
+                if self.adaptive[d]:
+                    print("free dim", self.free_dims[d])
+                    n_old = self.n_old[d]
+                    if self.eta is not None:
+                        maskc = self.coarse(v[shift:shift+n])
+                        maskc[:n_old] = True
+                        basis = np.array(self.bases[d])[maskc]
+                        self.bases[d] = list(basis)
+                        n = len(self.bases[d])
+                    nc = n - n_old
+                    if nc == 0:
+                        self.adaptive[d] = False
+                    print("added", nc, "basis functions")
+                self.n.append(n)
+                self.shift.append(self.shift[-1] + n)
 
             self.N = self.shift[-1]
             if self.N != self.shift_old[-1]:
                 self.compute_scaling_function_ind()
 
         self.j += 1
+        self.tol *= 0.5
+        self.build_interpolation_matrices()
+        self.inner_product.update_A()
+        g.reset()
+        self.restrict(self.residual, g)
+        g.apply_riesz_map(False)
 
     def update_control_vector(self, x: 'ControlVector'):
         x_old = x.vec_ro()
@@ -1363,6 +1350,7 @@ class AdaptiveWaveletControlSpace(BsplineWaveletControlSpace):
                 n = self.n[d]
             shift = self.shift[d]
             x.vec_wo().setValues(np.arange(n).astype(np.int32) + shift, x_1d)
+        x.vec_wo().assemble()
 
 
 class MRA(object):
@@ -1393,6 +1381,8 @@ class MRA(object):
 
         self.M0 = []
         self.scalings = []
+        # import matplotlib.pyplot as plt
+        # x = np.linspace(xmin, xmax, 1000)
         for j in range(min_level, j0 + 1):
             if j < j0:
                 # refinement matrix for scaling functions
@@ -1405,6 +1395,11 @@ class MRA(object):
             scalings = [BasisFunction1D(0, j, k, self)
                         for k in range(n_bdry, 2**j + d - 1 - n_bdry)]
             self.scalings.append(scalings)
+            # for b in scalings:
+            #     plt.plot(x, b(x), 'b-', linewidth=0.8)
+            # plt.xlim(xlim)
+            # plt.show()
+
 
         self.M1 = []
         self.wavelets = []
@@ -1420,6 +1415,10 @@ class MRA(object):
             wavelets = [BasisFunction1D(1, j, k, self)
                         for k in range(2**j)]
             self.wavelets.append(wavelets)
+            # for b in wavelets:
+            #     plt.plot(x, b(x), 'b-', linewidth=0.8)
+            # plt.xlim(xlim)
+            # plt.show()
 
     def get_knots(self, j):
         return self.knots[j - self.min_level]
@@ -1586,6 +1585,20 @@ class ControlVector(ROL.Vector):
         """
         self.inner_product.riesz_map(self, self)
 
+        Q = self.controlspace
+        if isinstance(Q, BsplineWaveletControlSpace) and Q.eta is not None:
+            v = self.vec_ro()
+            mask = np.full_like(v, False, dtype=bool)
+            for d in range(Q.dfree):
+                v_1d = v[d::Q.dfree]
+                mask_1d = Q.coarse(v_1d)
+                mask[d::Q.dfree] = mask_1d
+            mask[Q.ind_sf] = True
+            print("filtered {:.2%} entries".format((~mask).sum() / v.size))
+            self.vec_wo().setValues(np.where(~mask)[0].astype(np.int32),
+                                    np.zeros((~mask).sum()))
+            self.vec_wo().assemble()
+
     def vec_ro(self):
         if isinstance(self.data, fd.Function):
             with self.data.dat.vec_ro as v:
@@ -1640,6 +1653,12 @@ class ControlVector(ROL.Vector):
 
 
 class AdaptiveControlVector(ControlVector):
+    def apply_riesz_map(self, update_bases=True):
+        self.inner_product.riesz_map(self, self)
+
+        if update_bases:
+            self.controlspace.update_bases(self)
+
     def clone(self):
         res = AdaptiveControlVector(self.controlspace, self.inner_product,
                                     boundary_extension=self.boundary_extension)
@@ -1660,6 +1679,8 @@ class AdaptiveControlVector(ControlVector):
     def set(self, v):
         if self.vec_ro().size != self.controlspace.N:
             self.reset()
+        if v.vec_ro().size != self.controlspace.N:
+            self.controlspace.update_control_vector(v)
         super().set(v)
 
     def reset(self):
