@@ -2,14 +2,18 @@ from .innerproduct import InnerProduct
 import ROL
 import firedrake as fd
 
-__all__ = ["FeControlSpace", "FeMultiGridControlSpace",
-           "BsplineControlSpace", "ControlVector"]
+__all__ = ["FeControlSpace", "FeMultiGridControlSpace", "BsplineControlSpace",
+           "WaveletControlSpace", "ControlVector", "WaveletControlVector"]
 
 # new imports for splines
 from firedrake.petsc import PETSc
 from functools import reduce
+from itertools import product
 from scipy.interpolate import splev
+from scipy.special import binom
+from math import ceil, floor
 import numpy as np
+import matplotlib.pyplot as plt
 
 
 class ControlSpace(object):
@@ -654,6 +658,200 @@ class BsplineControlSpace(ControlSpace):
         vec.vec_wo().load(viewer)
 
 
+class WaveletControlSpace(BsplineControlSpace):
+    """ControlSpace based on cartesian tensorized wavelets."""
+
+    def __init__(self, mesh, bbox, primal_orders, dual_orders, nsplines,
+                 max_level, deriv_orders=0, fixed_dims=[], tol=1e-5, eta=None):
+        self.dim = len(bbox)  # geometric dimension
+        self.bbox = bbox
+        self.max_level = max_level
+        if isinstance(deriv_orders, int):
+            deriv_orders = [deriv_orders]
+        if isinstance(fixed_dims, int):
+            fixed_dims = [fixed_dims]
+        self.fixed_dims = fixed_dims
+        self.free_dims = list(set(range(self.dim)) - set(self.fixed_dims))
+        self.dfree = len(self.free_dims)
+        self.tol = tol
+        self.eta = eta
+
+        self.mesh_r = mesh
+        max_degree = max(primal_orders) - 1
+        element = fd.VectorElement("CG", mesh.ufl_cell(), max_degree)
+        self.V_r = fd.FunctionSpace(self.mesh_r, element)
+        X = fd.SpatialCoordinate(self.mesh_r)
+        self.id = fd.Function(self.V_r).interpolate(X)
+        self.T = fd.Function(self.V_r, name="T")
+        self.T.assign(self.id)
+        self.mesh_m = fd.Mesh(self.T)
+        self.V_m = fd.FunctionSpace(self.mesh_m, element)
+
+        assert self.dim == self.mesh_r.geometric_dimension()
+
+        x_fct = fd.SpatialCoordinate(self.mesh_r)
+        cell_size = []
+        exact_range = []
+        riesz_range = []
+        basis = []
+        for dim in range(self.dim):
+            xmin, xmax = bbox[dim]
+            d = primal_orders[dim]
+            d_t = dual_orders[dim]
+            nspline = nsplines[dim]
+            nx = nspline + d - 1
+            dx = (xmax - xmin) / nx
+            cell_size.append(dx)
+            exact_min = xmin + (d - 1) * dx
+            exact_max = xmax - (d - 1) * dx
+            if exact_min < exact_max:
+                exact_range.append((exact_min, exact_max))
+            else:
+                exact_range.append(None)
+            riesz_min = xmin + (d + d_t - 2) * dx
+            riesz_max = xmax - (d + d_t - 2) * dx
+            if riesz_min < riesz_max:
+                riesz_range.append((riesz_min, riesz_max))
+            else:
+                riesz_range.append(None)
+
+            assert (d + d_t) % 2 == 0
+            l1_t = -floor(d / 2) - d_t + 1
+            l2_t = ceil(d / 2) + d_t - 1
+            K = (d + d_t) // 2
+            b = []
+            for k in range(l1_t, l2_t + 1):
+                a_t = 0
+                for n in range(K):
+                    for i in range(2 * n + 1):
+                        a_t += 2**(1 - d_t - 2 * n) * (-1)**(n + i) \
+                            * binom(d_t, k + floor(d_t / 2) - i + n) \
+                            * binom(K - 1 + n, n) * binom(2 * n, i)
+                b.append((-1)**k * a_t)
+            b.reverse()
+            coeffs = np.zeros(3 * d + 2 * d_t - 3)
+            coeffs[d-1:2*(d+d_t-1)] = b
+            x = fd.interpolate(x_fct[dim], self.V_r.sub(0)).vector().array()
+            self.M = x.size
+
+            basis_1d = []
+            for k in range(nspline):
+                supp = (xmin + k * dx, xmin + (k + d) * dx)
+                basis_1d.append(BasisFunction1D(d, d_t, 0, 0, k, supp, nx, dx,
+                                                coeffs, deriv_orders, x))
+            basis.append(basis_1d)
+        print("Cell size:", cell_size)
+        print("Polynomial exactness:", exact_range)
+        print("Riesz basis:", riesz_range)
+        basis = [BasisFunction(b) for b in product(*basis)]
+        self.bases = [basis] * self.dfree
+        self.N = len(basis) * self.dfree
+
+        self.j = 0
+        self.build_interpolation_matrix()
+
+    def build_interpolation_matrix(self):
+        FullIFW = PETSc.Mat().create()
+        FullIFW.setType(PETSc.Mat.Type.AIJ)
+
+        dim = self.dim
+        FullIFW.setSizes((dim * self.M, self.N))
+        FullIFW.setUp()
+
+        shift = 0
+        for j in range(self.j + 1):
+            for i, d in enumerate(self.free_dims):
+                basis = self.bases[j * self.dfree + i]
+                n = len(basis)
+                for idx in range(n):
+                    values = basis[idx].eval()
+                    rows = np.where(values != 0)[0].astype(np.int32)
+                    values = values[rows]
+                    FullIFW.setValues(dim * rows + d,
+                                      [idx + shift],
+                                      values)
+                shift += n
+        FullIFW.assemble()
+        self.FullIFW = FullIFW
+
+
+class BasisFunction1D(object):
+    def __init__(self, d, d_t, e, j, k, supp, nx, dx, coeffs, s, x):
+        self.d = d
+        self.d_t = d_t
+        self.e = e
+        self.j = j
+        self.k = k
+        self.supp = supp
+        self.nx = nx
+        self.dx = dx
+        self.coeffs = coeffs
+        self.s = s
+        self.x = x
+        self.values = None
+
+    def __hash__(self):
+        return hash((self.e, self.j, self.k))
+
+    def __eq__(self, other):
+        return self.e == other.e and self.j == other.j and self.k == other.k
+
+    def eval(self):
+        if self.values is None:
+            if self.e == 0:
+                d = self.d
+                knots = np.concatenate((np.zeros(d - 1),
+                                        np.linspace(0, 1, d + 1),
+                                        np.ones(d - 1)))
+                coeffs = np.zeros(2 * d - 1)
+                coeffs[d - 1] = 1.
+            else:
+                d = self.d
+                d_t = self.d_t
+                knots = np.concatenate((np.zeros(d - 1),
+                                        np.linspace(0, 1, 2 * d + 2 * d_t - 1),
+                                        np.ones(d - 1)))
+                coeffs = self.coeffs
+            xmin, xmax = self.supp
+            knots = knots * (xmax - xmin) + xmin
+            factor = 0
+            for s in self.s:
+                factor += 2**s
+            coeffs *= 2**(self.j / 2) / factor
+            order = d - 1
+            tck = (knots, coeffs, order)
+            self.values = splev(self.x, tck, der=0, ext=1)
+        return self.values
+
+    def get_children(self, j):
+        children = [self]
+        return children
+
+
+class BasisFunction(object):
+    def __init__(self, basis_function_1d):
+        self.basis_function_1d = basis_function_1d
+
+    def __hash__(self):
+        return hash(self.basis_function_1d)
+
+    def __eq__(self, other):
+        res = True
+        for b1, b2 in zip(self.basis_function_1d, other.basis_function_1d):
+            res &= (b1 == b2)
+        return res
+
+    def eval(self):
+        res = 1.
+        for b in self.basis_function_1d:
+            res *= b.eval()
+        return res
+
+    def get_children(self, j):
+        children_1d = [b_1d.get_children(j) for b_1d in self.basis_function_1d]
+        return [BasisFunction(c) for c in product(*children_1d)][1:]
+
+
 class ControlVector(ROL.Vector):
     """
     A ControlVector is a variable in the ControlSpace.
@@ -759,3 +957,51 @@ class ControlVector(ROL.Vector):
     def __str__(self):
         """String representative, so we can call print(vec)."""
         return self.vec_ro()[:].__str__()
+
+
+class WaveletControlVector(ControlVector):
+    def __init__(self, controlspace: WaveletControlSpace, data=None):
+        super().__init__(controlspace, None, data=data)
+
+    def apply_riesz_map(self):
+        pass
+
+    def plus(self, v):
+        self.check(self)
+        self.check(v)
+        super().plus(v)
+
+    def scale(self, alpha):
+        self.check(self)
+        super().scale(alpha)
+
+    def clone(self):
+        res = WaveletControlVector(self.controlspace)
+        return res
+
+    def dot(self, v):
+        self.check(self)
+        self.check(v)
+        return PETSc.Vec.dot(self.vec_ro(), v.vec_ro())
+
+    def norm(self):
+        self.check(self)
+        return super().norm()
+
+    def axpy(self, alpha, x):
+        self.check(self)
+        self.check(x)
+        super().axpy(alpha, x)
+
+    def set(self, v):
+        self.check(self, reset=True)
+        self.check(v)
+        super().set(v)
+
+    def check(self, v, reset=False):
+        vr = v.vec_ro()
+        if vr.size != self.controlspace.N:
+            vnew = self.controlspace.get_zero_vec()
+            if not reset:
+                vnew[:vr.size] = vr
+            v.data = vnew
