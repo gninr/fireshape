@@ -2,14 +2,16 @@ from .innerproduct import InnerProduct
 import ROL
 import firedrake as fd
 
-__all__ = ["FeControlSpace", "FeMultiGridControlSpace",
-           "BsplineControlSpace", "ControlVector"]
+__all__ = ["FeControlSpace", "FeMultiGridControlSpace", "BsplineControlSpace",
+           "WaveletControlSpace", "ControlVector"]
 
 # new imports for splines
 from firedrake.petsc import PETSc
 from functools import reduce
 from scipy.interpolate import splev
 import numpy as np
+from scipy.special import binom
+from math import ceil, floor
 
 
 class ControlSpace(object):
@@ -652,6 +654,149 @@ class BsplineControlSpace(ControlSpace):
         """
         viewer = PETSc.Viewer().createBinary(filename, mode="r")
         vec.vec_wo().load(viewer)
+
+
+class WaveletControlSpace(BsplineControlSpace):
+    def __init__(self, mesh, bbox, nx, primal_orders, dual_orders, levels,
+                 deriv_orders, fixed_dims=[]):
+        self.nx = nx
+        self.dual_orders = dual_orders
+        if isinstance(deriv_orders, int):
+            deriv_orders = [deriv_orders]
+        self.deriv_orders = deriv_orders
+        super().__init__(mesh, bbox, primal_orders, levels, fixed_dims)
+
+    def construct_knots(self):
+        self.knots = []
+        self.n = []
+        self.nj = []
+        for dim in range(self.dim):
+            nx = self.nx[dim]
+            d = self.orders[dim]
+            d_t = self.dual_orders[dim]
+            J = self.levels[dim]
+            assert (d + d_t) % 2 == 0
+
+            self.knots.append(np.empty(2**J * nx + 1))
+
+            n = nx - d + 1
+            assert n > 0
+            nj = [n]
+            for j in range(J):
+                nspline = 2**j * nx - d - d_t + 2
+                if nspline <= 0:
+                    print("No wavelet on level", j)
+                    nj.append(0)
+                else:
+                    n += nspline
+                    nj.append(nspline)
+            self.n.append(n)
+            self.nj.append(nj)
+        self.N = np.prod(self.n)
+
+    def construct_1d_interpolation_matrices(self, V):
+        """
+        Create a list of sparse matrices (one per geometric dimension).
+
+        Each matrix has size (M, n[dim]), where M is the dimension of the
+        self.V_r.sub(0), and n[dim] is the dimension of the univariate
+        spline space associated to the dimth-geometric coordinate.
+        The ith column of such a matrix is computed by evaluating the ith
+        univariate basis function on the dimth-geometric coordinate of the dofs
+        of self.V_r(0)
+        """
+        interp_1d = []
+
+        # this code is correct but can be made more beautiful
+        # by replacing x_fct with self.id
+        x_fct = fd.SpatialCoordinate(self.mesh_r)  # used for x_int
+        # compute self.M, x_int will be overwritten below
+        x_int = fd.interpolate(x_fct[0], V.sub(0))
+        self.M = x_int.vector().size()
+
+        comm = self.comm
+
+        u, v = fd.TrialFunction(V.sub(0)), fd.TestFunction(V.sub(0))
+        mass_temp = fd.assemble(u * v * fd.dx)
+        self.lg_map_fe = mass_temp.petscmat.getLGMap()[0]
+
+        for dim in range(self.dim):
+            xmin, xmax = self.bbox[dim]
+            nx = self.nx[dim]
+            d = self.orders[dim]
+            d_t = self.dual_orders[dim]
+            J = self.levels[dim]
+            n = self.n[dim]
+            nj = self.nj[dim]
+
+            # owned part of global problem
+            local_n = n // comm.size + int(comm.rank < (n % comm.size))
+            I = PETSc.Mat().create(comm=self.comm)
+            I.setType(PETSc.Mat.Type.AIJ)
+            lsize = x_int.vector().local_size()
+            gsize = x_int.vector().size()
+            I.setSizes(((lsize, gsize), (local_n, n)))
+            I.setUp()
+
+            x_int = fd.interpolate(x_fct[dim], V.sub(0))
+            x = x_int.vector().get_local()
+            degree = d - 1
+
+            def set_values(knots, coeffs, col):
+                tck = (knots, coeffs, degree)
+                values = splev(x, tck, der=0, ext=1)
+                rows = np.where(values != 0)[0].astype(np.int32)
+                values = values[rows]
+                rows_is = PETSc.IS().createGeneral(rows)
+                global_rows_is = self.lg_map_fe.applyIS(rows_is)
+                rows = global_rows_is.array
+                I.setValues(rows, [col], values)
+
+            dx = (xmax - xmin) / nx
+            knots_s = np.concatenate((np.zeros(d - 1),
+                                      np.linspace(0, 1, d + 1),
+                                      np.ones(d - 1)))
+            coeffs_s = np.zeros(2 * d - 1)
+            coeffs_s[d - 1] = 1. / len(self.deriv_orders)
+            for k in range(nj[0]):
+                l1 = xmin + k * dx
+                l2 = xmin + (k + d) * dx
+                knots = knots_s * (l2 - l1) + l1
+                set_values(knots, coeffs_s, k)
+
+            knots_w = np.concatenate((np.zeros(d - 1),
+                                      np.linspace(0, 1, 2 * d + 2 * d_t - 1),
+                                      np.ones(d - 1)))
+            l1_t = -floor(d / 2) - d_t + 1
+            l2_t = ceil(d / 2) + d_t - 1
+            K = (d + d_t) // 2
+            b = []
+            for k in range(l1_t, l2_t + 1):
+                a_t = 0
+                for n in range(K):
+                    for i in range(2 * n + 1):
+                        a_t += 2**(1 - d_t - 2 * n) * (-1)**(n + i) \
+                            * binom(d_t, k + floor(d_t / 2) - i + n) \
+                            * binom(K - 1 + n, n) * binom(2 * n, i)
+                b.append((-1)**k * a_t)
+            b.reverse()
+            coeffs_w = np.concatenate((np.zeros(d - 1), b, np.zeros(d - 1)))
+            offset = nj[0]
+            for j in range(J):
+                coeffs = 2**(j / 2) * coeffs_w
+                coeffs /= np.sum(2**(j * np.array(self.deriv_orders)))
+                for k in range(nj[j + 1]):
+                    l1 = xmin + k * dx
+                    l2 = xmin + (k + d + d_t - 1) * dx
+                    knots = knots_w * (l2 - l1) + l1
+                    set_values(knots, coeffs, k + offset)
+                offset += nj[j + 1]
+                dx /= 2
+
+            I.assemble()
+            interp_1d.append(I)
+
+        return interp_1d
 
 
 class ControlVector(ROL.Vector):
