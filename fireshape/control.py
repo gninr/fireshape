@@ -13,7 +13,6 @@ from scipy.interpolate import splev
 from scipy.special import binom
 from math import ceil, floor
 import numpy as np
-import matplotlib.pyplot as plt
 
 
 class ControlSpace(object):
@@ -662,7 +661,7 @@ class WaveletControlSpace(BsplineControlSpace):
     """ControlSpace based on cartesian tensorized wavelets."""
 
     def __init__(self, mesh, bbox, primal_orders, dual_orders, nsplines,
-                 max_level, deriv_orders=0, fixed_dims=[], tol=1e-5, eta=None):
+                 max_level, deriv_orders=0, fixed_dims=[], eta=None):
         self.dim = len(bbox)  # geometric dimension
         self.bbox = bbox
         self.max_level = max_level
@@ -673,7 +672,6 @@ class WaveletControlSpace(BsplineControlSpace):
         self.fixed_dims = fixed_dims
         self.free_dims = list(set(range(self.dim)) - set(self.fixed_dims))
         self.dfree = len(self.free_dims)
-        self.tol = tol
         self.eta = eta
 
         self.mesh_r = mesh
@@ -736,19 +734,21 @@ class WaveletControlSpace(BsplineControlSpace):
 
             basis_1d = []
             for k in range(nspline):
-                supp = (xmin + k * dx, xmin + (k + d) * dx)
-                basis_1d.append(BasisFunction1D(d, d_t, 0, 0, k, supp, nx, dx,
-                                                coeffs, deriv_orders, x))
+                b = BasisFunction1D(d, d_t, -1, k, nx, dx, xmin, coeffs,
+                                    deriv_orders, x)
+                basis_1d.append(b)
             basis.append(basis_1d)
         print("Cell size:", cell_size)
         print("Polynomial exactness:", exact_range)
         print("Riesz basis:", riesz_range)
         basis = [BasisFunction(b) for b in product(*basis)]
-        self.bases = [basis] * self.dfree
-        self.N = len(basis) * self.dfree
+        self.bases = [[basis] * self.dfree]
+        self.N = self.N_sf = len(basis) * self.dfree
 
-        self.j = 0
-        self.build_interpolation_matrix()
+        self.iter = 0
+        self.FullIFW = None
+        self.T_old = fd.Function(self.V_r, name="T_old")
+        self.T_old.assign(self.id)
 
     def build_interpolation_matrix(self):
         FullIFW = PETSc.Mat().create()
@@ -759,9 +759,9 @@ class WaveletControlSpace(BsplineControlSpace):
         FullIFW.setUp()
 
         shift = 0
-        for j in range(self.j + 1):
+        for basis_j in self.bases:
             for i, d in enumerate(self.free_dims):
-                basis = self.bases[j * self.dfree + i]
+                basis = basis_j[i]
                 n = len(basis)
                 for idx in range(n):
                     values = basis[idx].eval()
@@ -774,15 +774,62 @@ class WaveletControlSpace(BsplineControlSpace):
         FullIFW.assemble()
         self.FullIFW = FullIFW
 
+    def restrict(self, residual, out):
+        for j in range(-1, self.max_level):
+            basis = self.bases[-1]
+            basis_j = []
+            for d in range(self.dfree):
+                children = []
+                for b in basis[d]:
+                    children.extend(b.get_children(j))
+                children = list(set(children))
+                basis_j.append(children)
+                self.N += len(children)
+            self.bases.append(basis_j)
+
+        self.build_interpolation_matrix()
+        self.iter += 1
+        out.reset()
+        super().restrict(residual, out)
+
+        self.bases = [self.bases[0]]
+        self.N = self.N_sf
+
+    def update_domain(self, q: 'ControlVector'):
+        if self.FullIFW is None:
+            return True
+
+        if not hasattr(self, 'lastq') or self.lastq is None \
+           or self.lastq.iter != q.iter:
+            self.lastq = q.clone()
+            self.lastq.set(q)
+        else:
+            self.lastq.axpy(-1., q)
+            diff = self.lastq.vec_ro().norm()
+            self.lastq.axpy(+1., q)
+            if diff < 1e-20:
+                self.T_old.assign(self.T)
+                return False
+            else:
+                self.lastq.set(q)
+        q.to_coordinatefield(self.T)
+        self.T += self.T_old
+        return True
+
+    def get_zero_vec(self):
+        if self.FullIFW is None:
+            return None
+        else:
+            return super().get_zero_vec()
+
 
 class BasisFunction1D(object):
-    def __init__(self, d, d_t, e, j, k, supp, nx, dx, coeffs, s, x):
+    def __init__(self, d, d_t, j, k, nx, dx, xmin, coeffs, s, x):
         self.d = d
         self.d_t = d_t
-        self.e = e
         self.j = j
         self.k = k
-        self.supp = supp
+        self.xmin = xmin
         self.nx = nx
         self.dx = dx
         self.coeffs = coeffs
@@ -791,33 +838,38 @@ class BasisFunction1D(object):
         self.values = None
 
     def __hash__(self):
-        return hash((self.e, self.j, self.k))
+        return hash((self.j, self.k))
 
     def __eq__(self, other):
-        return self.e == other.e and self.j == other.j and self.k == other.k
+        return self.j == other.j and self.k == other.k
 
     def eval(self):
         if self.values is None:
-            if self.e == 0:
+            if self.j == -1:
                 d = self.d
+                xmin, xmax = (self.xmin + self.k * self.dx,
+                              self.xmin + (self.k + d) * self.dx)
                 knots = np.concatenate((np.zeros(d - 1),
                                         np.linspace(0, 1, d + 1),
                                         np.ones(d - 1)))
                 coeffs = np.zeros(2 * d - 1)
                 coeffs[d - 1] = 1.
+                j = 0
             else:
                 d = self.d
                 d_t = self.d_t
+                xmin, xmax = (self.xmin + self.k * self.dx,
+                              self.xmin + (self.k + d + d_t - 1) * self.dx)
                 knots = np.concatenate((np.zeros(d - 1),
                                         np.linspace(0, 1, 2 * d + 2 * d_t - 1),
                                         np.ones(d - 1)))
                 coeffs = self.coeffs
-            xmin, xmax = self.supp
+                j = self.j
             knots = knots * (xmax - xmin) + xmin
             factor = 0
             for s in self.s:
-                factor += 2**s
-            coeffs *= 2**(self.j / 2) / factor
+                factor += 2**(j * s)
+            coeffs = 2**(j / 2) / factor * coeffs
             order = d - 1
             tck = (knots, coeffs, order)
             self.values = splev(self.x, tck, der=0, ext=1)
@@ -825,6 +877,27 @@ class BasisFunction1D(object):
 
     def get_children(self, j):
         children = [self]
+        if j == self.j:
+            d = self.d
+            d_t = self.d_t
+            if j == -1:
+                nx = self.nx
+                kmin = max(self.k - d - d_t + 2, 0)
+                kmax = min(self.k + d - 1, nx - d - d_t + 1)
+                for k in range(kmin, kmax + 1):
+                    child = BasisFunction1D(
+                        d, d_t, 0, k, nx, self.dx, self.xmin,
+                        self.coeffs, self.s, self.x)
+                    children.append(child)
+            else:
+                nx = self.nx * 2
+                kmin = max(2 * self.k - d - d_t + 2, 0)
+                kmax = min(2 * (self.k + d + d_t) - 3, nx - d - d_t + 1)
+                for k in range(kmin, kmax + 1):
+                    child = BasisFunction1D(
+                        d, d_t, j + 1, k, nx, self.dx / 2, self.xmin,
+                        self.coeffs, self.s, self.x)
+                    children.append(child)
         return children
 
 
@@ -960,8 +1033,9 @@ class ControlVector(ROL.Vector):
 
 
 class WaveletControlVector(ControlVector):
-    def __init__(self, controlspace: WaveletControlSpace, data=None):
+    def __init__(self, controlspace: WaveletControlSpace, iter=0, data=None):
         super().__init__(controlspace, None, data=data)
+        self.iter = iter
 
     def apply_riesz_map(self):
         pass
@@ -976,7 +1050,8 @@ class WaveletControlVector(ControlVector):
         super().scale(alpha)
 
     def clone(self):
-        res = WaveletControlVector(self.controlspace)
+        self.check(self)
+        res = WaveletControlVector(self.controlspace, iter=self.iter)
         return res
 
     def dot(self, v):
@@ -994,14 +1069,15 @@ class WaveletControlVector(ControlVector):
         super().axpy(alpha, x)
 
     def set(self, v):
-        self.check(self, reset=True)
+        self.check(self)
         self.check(v)
-        super().set(v)
+        if v.vec_ro() is not None:
+            super().set(v)
 
-    def check(self, v, reset=False):
-        vr = v.vec_ro()
-        if vr.size != self.controlspace.N:
-            vnew = self.controlspace.get_zero_vec()
-            if not reset:
-                vnew[:vr.size] = vr
-            v.data = vnew
+    def check(self, v):
+        if v.iter != self.controlspace.iter:
+            v.reset()
+
+    def reset(self):
+        self.data = self.controlspace.get_zero_vec()
+        self.iter = self.controlspace.iter
