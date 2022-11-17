@@ -3,7 +3,8 @@ import firedrake as fd
 
 class ElasticityExtension(object):
 
-    def __init__(self, V, fixed_dims=[], direct_solve=False):
+    def __init__(self, V, fixed_dims=[], fixed_subdomains=[],
+                 direct_solve=False):
         if isinstance(fixed_dims, int):
             fixed_dims = [fixed_dims]
         self.V = V
@@ -27,6 +28,8 @@ class ElasticityExtension(object):
                 else:
                     bcs.append(fd.DirichletBC(self.V.sub(
                         i), self.bc_fun.sub(i), "on_boundary"))
+        for subdomain in fixed_subdomains:
+            bcs.append(fd.DirichletBC(self.V, self.zero, subdomain))
         self.A_ext = fd.assemble(self.a, bcs=bcs, mat_type="aij")
         self.ls_ext = fd.LinearSolver(
             self.A_ext, solver_parameters=self.get_params())

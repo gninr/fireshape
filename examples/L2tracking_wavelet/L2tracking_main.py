@@ -14,9 +14,10 @@ dual_orders = [3, 3]
 levels = [2, 2]
 deriv_orders = [0, 1]
 Q = fs.WaveletControlSpace(mesh, bbox, nx, primal_orders, dual_orders, levels,
-                           deriv_orders, vanish_on_boundary=False)
+                           deriv_orders, zero_bc_flag=False)
 inner = fs.H1InnerProduct(Q)
-extension = fs.ElasticityExtension(Q.V_r, direct_solve=True)
+extension = fs.ElasticityExtension(Q.V_r, fixed_subdomains=[2],
+                                   direct_solve=True)
 q = fs.ControlVector(Q, inner, boundary_extension=extension)
 
 # Setup PDE constraint

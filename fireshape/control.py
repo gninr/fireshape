@@ -659,20 +659,25 @@ class BsplineControlSpace(ControlSpace):
 
 class WaveletControlSpace(BsplineControlSpace):
     def __init__(self, mesh, bbox, nx, primal_orders, dual_orders, levels,
-                 deriv_orders, vanish_on_boundary=True, fixed_dims=[],
-                 tol=None):
+                 deriv_orders, zero_bc_flag=True, fixed_dims=[], tol=None):
+        self.bbox_inner = bbox.copy()
+        if not zero_bc_flag:
+            for dim in range(len(bbox)):
+                xmin, xmax = bbox[dim]
+                dx = (xmax - xmin) / nx[dim]
+                L = (primal_orders[dim] + dual_orders[dim] - 2) * dx
+                bbox[dim] = (xmin - L, xmax + L)
         self.nx = nx
         self.dual_orders = dual_orders
         if isinstance(deriv_orders, int):
             deriv_orders = [deriv_orders]
         self.deriv_orders = deriv_orders
-        self.vanish_on_boundary = vanish_on_boundary
+        self.zero_bc_flag = zero_bc_flag
         super().__init__(mesh, bbox, primal_orders, levels, fixed_dims)
 
     def construct_knots(self):
         self.knots = []
         self.n = []
-        self.nj = []
         self.klim = []
         for dim in range(self.dim):
             nx = self.nx[dim]
@@ -681,32 +686,31 @@ class WaveletControlSpace(BsplineControlSpace):
             J = self.levels[dim]
             assert (d + d_t) % 2 == 0
 
-            self.knots.append(np.empty(2**J * nx + 1))
-
-            if self.vanish_on_boundary:
-                n = nx - d + 1
-                assert n > 0
-                klim = [(0, n - 1)]
+            if self.zero_bc_flag:
+                self.knots.append(np.empty(2**J * nx + 1))
+                kmin = 0
+                kmax = nx - d
             else:
-                n = nx + d - 1
-                klim = [(1 - d, nx - 1)]
-            nj = [n]
+                self.knots.append(np.empty(2**J * (nx + 2 * (d + d_t - 2)) + 1))
+                kmin = 1 - d
+                kmax = nx - 1
+            n = kmax - kmin + 1
+            assert n > 0
+            klim = [(kmin, kmax)]
+
+            if not self.zero_bc_flag:
+                kmin = 2 - d - d_t
             for j in range(J):
-                if self.vanish_on_boundary:
-                    nwavelet = 2**j * nx - d - d_t + 2
-                    if nwavelet <= 0:
+                if self.zero_bc_flag:
+                    kmax = 2**j * nx - d - d_t + 1
+                    if kmax < 0:
                         print("No wavelet on level", j)
-                        nwavelet = 0
-                    n += nwavelet
-                    nj.append(nwavelet)
-                    klim.append((0, nwavelet - 1))
+                        kmax = -1
                 else:
-                    nwavelet = 2**j * nx + d + d_t - 2
-                    n += nwavelet
-                    nj.append(nwavelet)
-                    klim.append((2 - d - d_t, 2**j * nx - 1))
+                    kmax = 2**j * nx - 1
+                n += kmax - kmin + 1
+                klim.append((kmin, kmax))
             self.n.append(n)
-            self.nj.append(nj)
             self.klim.append(klim)
         self.N = np.prod(self.n)
 
@@ -730,40 +734,34 @@ class WaveletControlSpace(BsplineControlSpace):
         x_int = fd.interpolate(x_fct[0], V.sub(0))
         self.M = x_int.vector().size()
 
-        comm = self.comm
-
         u, v = fd.TrialFunction(V.sub(0)), fd.TestFunction(V.sub(0))
         mass_temp = fd.assemble(u * v * fd.dx)
         self.lg_map_fe = mass_temp.petscmat.getLGMap()[0]
 
         for dim in range(self.dim):
-            xmin, xmax = self.bbox[dim]
+            xmin, xmax = self.bbox_inner[dim]
             nx = self.nx[dim]
             d = self.orders[dim]
             d_t = self.dual_orders[dim]
             J = self.levels[dim]
             n = self.n[dim]
-            nj = self.nj[dim]
             klim = self.klim[dim]
 
             # owned part of global problem
-            local_n = n // comm.size + int(comm.rank < (n % comm.size))
             I = PETSc.Mat().create(comm=self.comm)
             I.setType(PETSc.Mat.Type.AIJ)
             lsize = x_int.vector().local_size()
             gsize = x_int.vector().size()
-            I.setSizes(((lsize, gsize), (local_n, n)))
+            I.setSizes(((lsize, gsize), (n, n)))
             I.setUp()
 
             x_int = fd.interpolate(x_fct[dim], V.sub(0))
             x = x_int.vector().get_local()
-            x_mask = (xmin <= x) & (x <= xmax)
             degree = d - 1
 
             def set_values(knots, coeffs, col):
                 tck = (knots, coeffs, degree)
                 values = splev(x, tck, der=0, ext=1)
-                values[~x_mask] = 0.
                 rows = np.where(values != 0)[0].astype(np.int32)
                 values = values[rows]
                 rows_is = PETSc.IS().createGeneral(rows)
@@ -771,6 +769,7 @@ class WaveletControlSpace(BsplineControlSpace):
                 rows = global_rows_is.array
                 I.setValues(rows, [col], values)
 
+            col = 0
             dx = (xmax - xmin) / nx
             knots_s = np.concatenate((np.zeros(d - 1),
                                       np.linspace(0, 1, d + 1),
@@ -778,12 +777,12 @@ class WaveletControlSpace(BsplineControlSpace):
             coeffs_s = np.zeros(2 * d - 1)
             coeffs_s[d - 1] = 1. / len(self.deriv_orders)
             kmin, kmax = klim[0]
-            offset = -kmin
             for k in range(kmin, kmax + 1):
                 l1 = xmin + k * dx
                 l2 = xmin + (k + d) * dx
                 knots = knots_s * (l2 - l1) + l1
-                set_values(knots, coeffs_s, k + offset)
+                set_values(knots, coeffs_s, col)
+                col += 1
 
             knots_w = np.concatenate((np.zeros(d - 1),
                                       np.linspace(0, 1, 2 * d + 2 * d_t - 1),
@@ -794,26 +793,26 @@ class WaveletControlSpace(BsplineControlSpace):
             b = []
             for k in range(l1_t, l2_t + 1):
                 a_t = 0
-                for n in range(K):
-                    for i in range(2 * n + 1):
-                        a_t += 2**(1 - d_t - 2 * n) * (-1)**(n + i) \
-                            * binom(d_t, k + floor(d_t / 2) - i + n) \
-                            * binom(K - 1 + n, n) * binom(2 * n, i)
+                for m in range(K):
+                    for i in range(2 * m + 1):
+                        a_t += 2**(1 - d_t - 2 * m) * (-1)**(m + i) \
+                            * binom(d_t, k + floor(d_t / 2) - i + m) \
+                            * binom(K - 1 + m, m) * binom(2 * m, i)
                 b.append((-1)**k * a_t)
             b.reverse()
             coeffs_w = np.concatenate((np.zeros(d - 1), b, np.zeros(d - 1)))
             for j in range(J):
-                offset += kmin + nj[j]
                 coeffs = 2**(j / 2) * coeffs_w
                 coeffs /= np.sum(2**(j * np.array(self.deriv_orders)))
                 kmin, kmax = klim[j + 1]
-                offset -= kmin
                 for k in range(kmin, kmax + 1):
                     l1 = xmin + k * dx
                     l2 = xmin + (k + d + d_t - 1) * dx
                     knots = knots_w * (l2 - l1) + l1
-                    set_values(knots, coeffs, k + offset)
+                    set_values(knots, coeffs, col)
+                    col += 1
                 dx /= 2
+            assert col == n
 
             I.assemble()
             interp_1d.append(I)

@@ -4,7 +4,7 @@ import ROL
 from L2tracking_PDEconstraint import PoissonSolver
 from L2tracking_objective import L2trackingObjective
 
-# Set up problem
+# Setup problem
 mesh = fd.Mesh("mesh.msh")
 
 bbox = [(-3., -1.), (-1., 1.)]
@@ -14,7 +14,7 @@ Q = fs.BsplineControlSpace(mesh, bbox, orders, levels)
 inner = fs.H1InnerProduct(Q)
 q = fs.ControlVector(Q, inner)
 
-# Set up PDE constraint
+# Setup PDE constraint
 rt = 0.5
 ct = (-1.9, 0.)
 mesh_m = Q.mesh_m
