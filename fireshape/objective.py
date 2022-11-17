@@ -271,7 +271,8 @@ class ReducedObjective(ShapeObjective):
         Get the derivative from pyadjoint.
         """
 
-        out.from_first_derivative(self.Jred.derivative())
+        self.deriv_m.assign(self.Jred.derivative())
+        out.from_first_derivative(self.deriv_r)
 
     def update(self, x, flag, iteration):
         """Update domain and solution to state and adjoint equation."""

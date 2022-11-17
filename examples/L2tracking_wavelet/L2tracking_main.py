@@ -4,21 +4,22 @@ import ROL
 from L2tracking_PDEconstraint import PoissonSolver
 from L2tracking_objective import L2trackingObjective
 
-# Set up problem
+# Setup problem
 mesh = fd.Mesh("mesh.msh")
 
 bbox = [(-3., -1.), (-1., 1.)]
-nx = [6, 6]
+nx = [1, 1]
 primal_orders = [3, 3]
 dual_orders = [3, 3]
 levels = [2, 2]
 deriv_orders = [0, 1]
 Q = fs.WaveletControlSpace(mesh, bbox, nx, primal_orders, dual_orders, levels,
-                           deriv_orders)
+                           deriv_orders, vanish_on_boundary=False)
 inner = fs.H1InnerProduct(Q)
-q = fs.ControlVector(Q, inner)
+extension = fs.ElasticityExtension(Q.V_r, direct_solve=True)
+q = fs.ControlVector(Q, inner, boundary_extension=extension)
 
-# Set up PDE constraint
+# Setup PDE constraint
 rt = 0.5
 ct = (-1.9, 0.)
 mesh_m = Q.mesh_m
