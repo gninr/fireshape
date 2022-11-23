@@ -11,10 +11,11 @@ bbox = [(-3., -1.), (-1., 1.)]
 nx = [1, 1]
 primal_orders = [3, 3]
 dual_orders = [3, 3]
-levels = [2, 2]
+max_level = 3
 deriv_orders = [0, 1]
-Q = fs.WaveletControlSpace(mesh, bbox, nx, primal_orders, dual_orders, levels,
-                           deriv_orders, zero_bc_flag=False)
+Q = fs.WaveletControlSpace(mesh, bbox, nx, primal_orders, dual_orders,
+                           max_level, deriv_orders, zero_bc_flag=False,
+                           tol=0.3)
 inner = fs.H1InnerProduct(Q)
 extension = fs.ElasticityExtension(Q.V_r, fixed_subdomains=[2],
                                    direct_solve=True)

@@ -658,7 +658,7 @@ class BsplineControlSpace(ControlSpace):
 
 
 class WaveletControlSpace(BsplineControlSpace):
-    def __init__(self, mesh, bbox, nx, primal_orders, dual_orders, levels,
+    def __init__(self, mesh, bbox, nx, primal_orders, dual_orders, max_level,
                  deriv_orders, zero_bc_flag=True, fixed_dims=[], tol=None):
         self.bbox_inner = bbox.copy()
         if not zero_bc_flag:
@@ -673,19 +673,26 @@ class WaveletControlSpace(BsplineControlSpace):
             deriv_orders = [deriv_orders]
         self.deriv_orders = deriv_orders
         self.zero_bc_flag = zero_bc_flag
+        self.max_level = max_level
+        levels = max_level * len(bbox)
         super().__init__(mesh, bbox, primal_orders, levels, fixed_dims)
+
+        self.tol = tol
+        self.dfree = self.dim - len(fixed_dims)
 
     def construct_knots(self):
         self.knots = []
         self.n = []
+        self.offset = []
         self.klim = []
+        J = self.max_level
         for dim in range(self.dim):
             nx = self.nx[dim]
             d = self.orders[dim]
             d_t = self.dual_orders[dim]
-            J = self.levels[dim]
             assert (d + d_t) % 2 == 0
 
+            offset = [0]
             if self.zero_bc_flag:
                 self.knots.append(np.empty(2**J * nx + 1))
                 kmin = 0
@@ -696,6 +703,7 @@ class WaveletControlSpace(BsplineControlSpace):
                 kmax = nx - 1
             n = kmax - kmin + 1
             assert n > 0
+            offset.append(n)
             klim = [(kmin, kmax)]
 
             if not self.zero_bc_flag:
@@ -709,8 +717,10 @@ class WaveletControlSpace(BsplineControlSpace):
                 else:
                     kmax = 2**j * nx - 1
                 n += kmax - kmin + 1
+                offset.append(n)
                 klim.append((kmin, kmax))
             self.n.append(n)
+            self.offset.append(offset)
             self.klim.append(klim)
         self.N = np.prod(self.n)
 
@@ -738,12 +748,12 @@ class WaveletControlSpace(BsplineControlSpace):
         mass_temp = fd.assemble(u * v * fd.dx)
         self.lg_map_fe = mass_temp.petscmat.getLGMap()[0]
 
+        J = self.max_level
         for dim in range(self.dim):
             xmin, xmax = self.bbox_inner[dim]
             nx = self.nx[dim]
             d = self.orders[dim]
             d_t = self.dual_orders[dim]
-            J = self.levels[dim]
             n = self.n[dim]
             klim = self.klim[dim]
 
@@ -819,6 +829,87 @@ class WaveletControlSpace(BsplineControlSpace):
 
         return interp_1d
 
+    def idx_kron(self, v, w):
+        idx1, len1 = v
+        idx2, len2 = w
+        lenout = len1 * len2
+        idxout = (np.array(idx1).reshape(-1, 1) * len2) + np.array(idx2)
+        return idxout.reshape(-1), lenout
+
+    def update_control_vector(self, q):
+        if self.tol is None:
+            return
+
+        vec = q.vec_ro().array
+
+        idx_s = []
+        idx_s_g = []
+        for dim in range(self.dim):
+            kmin, kmax = self.klim[dim][0]
+            idx_s.append([(-1, k) for k in range(kmin, kmax + 1)])
+            idx_s_g.append(range(self.offset[dim][1]))
+        idx_s = list(product(*idx_s))
+        idx_s_g, _ = reduce(self.idx_kron, zip(idx_s_g, self.n))
+
+        for d in range(self.dfree):
+            v = vec[d::self.dfree]
+            tol_sq = ((1 - self.tol) * np.linalg.norm(v))**2
+
+            vnew = np.zeros_like(v)
+            vnew[idx_s_g] = v[idx_s_g]
+            active = idx_s
+            sum = np.linalg.norm(vnew)**2
+            j = 0
+            while sum < tol_sq and j < self.max_level:
+                marked = []
+                for b in active:
+                    marked.extend(self.compute_children(j - 1, b))
+                marked = list(zip(*sorted(set(marked), key=lambda x: x[1])))
+                idx = list(marked[0])
+                idx_g = list(marked[1])
+                idx_sorted = np.argsort(-np.abs(v[idx_g]))
+                active = []
+                for i in range(len(idx)):
+                    ii = idx_sorted[i]
+                    iii = idx_g[ii]
+                    a = v[iii]
+                    vnew[iii] = a
+                    sum += a**2
+                    active.append(idx[ii])
+                    if sum >= tol_sq:
+                        break
+                j += 1
+            vec[d::self.dfree] = vnew
+
+    def compute_children(self, level, idxp):
+        idxc = []
+        idxc_g = []
+        for dim in range(self.dim):
+            j, k = idxp[dim]
+            idxc_1d = [(j, k)]
+            idxc_g_1d = \
+                [k - self.klim[dim][j + 1][0] + self.offset[dim][j + 1]]
+
+            if j == level:
+                kmin, kmax = self.klim[dim][j + 2]
+                d = self.orders[dim]
+                d_t = self.orders[dim]
+                if j == -1:
+                    kc_min = max(kmin, k - d - d_t + 2)
+                    kc_max = min(kmax, k + d - 1)
+                else:
+                    kc_min = max(kmin, 2 * k - d - d_t + 2)
+                    kc_max = min(kmax, 2 * (k + d + d_t) - 3)
+                kc_range = np.arange(kc_min, kc_max + 1)
+                idxc_1d += [(j + 1, kc) for kc in kc_range]
+                idxc_g_1d += list(kc_range - kmin + self.offset[dim][j + 2])
+            idxc.append(idxc_1d)
+            idxc_g.append(idxc_g_1d)
+
+        idxc = list(product(*idxc))
+        idxc_g, _ = reduce(self.idx_kron, zip(idxc_g, self.n))
+        return zip(idxc[1:], idxc_g[1:])
+
 
 class ControlVector(ROL.Vector):
     """
@@ -873,6 +964,7 @@ class ControlVector(ROL.Vector):
         Overwrites the content.
         """
         self.inner_product.riesz_map(self, self)
+        self.controlspace.update_control_vector(self)
 
     def vec_ro(self):
         if isinstance(self.data, fd.Function):
