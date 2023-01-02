@@ -687,7 +687,6 @@ class WaveletControlSpace(BsplineControlSpace):
         self.deriv_orders = deriv_orders
         self.boundary_regularities = boundary_regularities
         self.precompute()
-        print(self.j0)
         t2 = time.time()
         print("precompute", t2 - t1)
         levels = [level] * self.dim
@@ -1093,12 +1092,13 @@ class WaveletControlSpace(BsplineControlSpace):
         offset = 0
         offset = plot(self.refine[0][0][-1], self.refine[1][0][-1], offset)
         for j in range(self.J - self.j0):
-            offset = plot(self.refine[0][2*j+1][-1], self.refine[1][2*j+2][-1],
-                          offset)
-            offset = plot(self.refine[0][2*j+2][-1], self.refine[1][2*j+1][-1],
-                          offset)
-            offset = plot(self.refine[0][2*j+2][-1], self.refine[1][2*j+2][-1],
-                          offset)
+            nx0 = self.refine[0][2*j+1][-1]
+            nx1 = self.refine[0][2*j+2][-1]
+            ny0 = self.refine[1][2*j+1][-1]
+            ny1 = self.refine[1][2*j+2][-1]
+            offset = plot(nx0, ny1, offset)
+            offset = plot(nx1, ny0, offset)
+            offset = plot(nx1, ny1, offset)
 
 
 class ControlVector(ROL.Vector):
@@ -1153,7 +1153,9 @@ class ControlVector(ROL.Vector):
         Maps this vector into the dual space.
         Overwrites the content.
         """
+        # self.controlspace.visualize_control(self)
         self.inner_product.riesz_map(self, self)
+        # self.controlspace.visualize_control(self)
 
     def vec_ro(self):
         if isinstance(self.data, fd.Function):
